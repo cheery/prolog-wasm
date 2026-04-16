@@ -158,6 +158,17 @@ class SymbolTable:
                 if isinstance(val, str):
                     self.intern(val)
 
+    # -- L2 -> L3 interning helpers (used by InternSymbols pass) --
+
+    def intern_predicate_names(self, program2):
+        """Pre-intern all predicate names found in a Program2.
+
+        Called before building func_indices so that every atom used as a
+        predicate name has a stable ID before the pass traversal starts.
+        """
+        for pred in program2.predicates:
+            self.intern(pred.name)
+
     # -- summary --
 
     def summary(self) -> str:
@@ -167,3 +178,119 @@ class SymbolTable:
             packed_example = ""
             lines.append(f"  {aid:#010x}  idx={i:<4d}  {name}")
         return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Nanopass helpers
+# ---------------------------------------------------------------------------
+
+# Number of runtime WASM functions that appear before clause functions.
+# (FN_INIT through FN_BACKTRACK_RESTORE = indices 0-11)
+_RUNTIME_FUNC_COUNT = 12
+
+
+def build_func_indices(program2, base_fn: int = _RUNTIME_FUNC_COUNT) -> dict:
+    """Assign WASM function indices to every clause in a Program2.
+
+    Returns a dict that maps:
+      "name/arity"     -> index of the first clause for that predicate
+      "name/arity_cN"  -> index of the Nth clause (multi-clause predicates)
+
+    base_fn is the index of the first clause function (after all runtime
+    functions have been allocated).
+    """
+    func_indices = {}
+    next_fn = base_fn
+
+    for pred in program2.predicates:
+        key = f"{pred.name}/{pred.arity}"
+        first_fn = next_fn
+        for clause in pred.clauses:
+            func_indices[clause.label] = next_fn
+            next_fn += 1
+        func_indices[key] = first_fn
+
+    return func_indices
+
+
+# ---------------------------------------------------------------------------
+# InternSymbols pass: L2 -> L3
+# ---------------------------------------------------------------------------
+
+from nanopass import Pass
+from languages import L2, L3
+
+
+class InternSymbols(Pass, source=L2, target=L3):
+    """Resolve all symbolic references in L2 to integer IDs in L3.
+
+    Transforms:
+      - Constant values (str atoms, numbers) -> SymbolTable-encoded i32
+      - Functor (name, arity) pairs -> packed i32
+      - call/execute predicate names -> WASM function indices
+      - try_me_else / retry_me_else labels -> WASM function indices
+
+    The pass expander auto-generates identity visitors for the 26 L2 node
+    types whose structure is unchanged in L3.
+
+    Usage:
+        syms = SymbolTable()
+        fi = build_func_indices(program_l2)
+        program_l3 = InternSymbols(syms, fi)(program_l2)
+    """
+
+    def __init__(self, syms: SymbolTable, func_indices: dict):
+        self.syms = syms
+        self.fi = func_indices
+
+    # -- 10 explicit visitors for nodes that change between L2 and L3 --
+
+    def visit_GetConstant(self, node):
+        return L3.GetConstant(
+            value=self.syms.encode_constant(node.value),
+            ai=node.ai,
+        )
+
+    def visit_GetStructure(self, node):
+        return L3.GetStructure(
+            functor_packed=self.syms.functor_pack(node.functor, node.arity),
+            ai=node.ai,
+        )
+
+    def visit_PutConstant(self, node):
+        return L3.PutConstant(
+            value=self.syms.encode_constant(node.value),
+            ai=node.ai,
+        )
+
+    def visit_PutStructure(self, node):
+        return L3.PutStructure(
+            functor_packed=self.syms.functor_pack(node.functor, node.arity),
+            ai=node.ai,
+        )
+
+    def visit_UnifyConstant(self, node):
+        return L3.UnifyConstant(value=self.syms.encode_constant(node.value))
+
+    def visit_SetConstant(self, node):
+        return L3.SetConstant(value=self.syms.encode_constant(node.value))
+
+    def visit_Call(self, node):
+        key = f"{node.functor}/{node.arity}"
+        return L3.Call(func_index=self.fi[key])
+
+    def visit_Execute(self, node):
+        key = f"{node.functor}/{node.arity}"
+        return L3.Execute(func_index=self.fi[key])
+
+    def visit_TryMeElse(self, node):
+        return L3.TryMeElse(
+            next_func_index=self.fi[node.next_label],
+            arity=node.arity,
+        )
+
+    def visit_RetryMeElse(self, node):
+        return L3.RetryMeElse(
+            next_func_index=self.fi[node.next_label],
+            arity=node.arity,
+        )

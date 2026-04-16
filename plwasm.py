@@ -34,9 +34,11 @@ from wam_wasm import (
     build_pdl_push, build_pdl_pop, build_unify, build_backtrack_restore,
 )
 from prolog_parser import parse
-from prolog_compiler import compile_program
-from wam_emit import ClauseEmitter
-from symbols import SymbolTable
+from normalize_pass import NormalizeLists
+from prolog_compiler import compile_program_l2
+from wam_emit import ClauseEmitterL3, CompiledModule
+from symbols import SymbolTable, build_func_indices, InternSymbols
+from languages import L0, L2
 
 
 _RUNTIME_BUILDERS = [
@@ -50,16 +52,21 @@ def compile(source: str) -> tuple[bytes, SymbolTable]:
     """Compile Prolog source to a WASM module.
 
     Returns (wasm_bytes, syms).  The module exports run_get(n: i32) -> i32.
+
+    Pipeline:
+      parse -> L0 -> NormalizeLists -> L1 -> compile_program_l2 -> L2
+           -> InternSymbols -> L3 -> ClauseEmitterL3 -> bytes
     """
-    # 1. Parse and compile to WAM
-    program = parse(source)
-    predicates, queries = compile_program(program)
+    # 1. Parse: text -> L0
+    program_l0 = parse(source)
 
-    # 2. Intern symbols
-    syms = SymbolTable()
-    syms.intern_program(predicates, queries)
+    # 2. Normalize: L0 -> L1  (desugar List / BinOp / UnaryOp)
+    program_l1 = NormalizeLists()(program_l0)
 
-    # 3. Build type / function tables starting with the runtime
+    # 3. Compile: L1 -> L2  (Prolog terms -> typed WAM instructions)
+    program_l2 = compile_program_l2(program_l1)
+
+    # 4. Build WASM type / function tables with the runtime functions
     types = runtime_types()
     func_type_indices = []
     func_codes = []
@@ -71,36 +78,31 @@ def compile(source: str) -> tuple[bytes, SymbolTable]:
         func_type_indices.append(ti)
         func_codes.append(code)
 
-    # 4. First pass: assign function indices to every clause
-    func_indices = {}   # "pred/N_cK" and "pred/N" -> WASM function index
-    next_fn = len(func_type_indices)
+    # 5. Assign WASM function indices to every clause
+    fi = build_func_indices(program_l2, base_fn=len(func_type_indices))
 
-    for key, pred in predicates.items():
-        first_fn = next_fn
-        for ci, (label, _instrs) in enumerate(pred.clauses):
-            func_indices[label] = next_fn
-            next_fn += 1
-        func_indices[key] = first_fn
+    # 6. Resolve symbols: L2 -> L3
+    syms = SymbolTable()
+    syms.intern_predicate_names(program_l2)
+    program_l3 = InternSymbols(syms, fi)(program_l2)
 
-    # 5. Second pass: emit WASM clause bodies
-    emitter = ClauseEmitter(syms, func_indices)
+    # 7. Emit WASM clause bodies
+    declared_funcrefs = []
+    emitter = ClauseEmitterL3(declared_funcrefs)
 
-    for _key, pred in predicates.items():
-        for _ci, (label, instrs) in enumerate(pred.clauses):
+    for pred in program_l3.predicates:
+        for clause in pred.clauses:
             clause_ti = len(types)
             types.append(functype([], []))
             func_type_indices.append(clause_ti)
-            func_codes.append(emitter.emit(instrs).encode())
+            func_codes.append(emitter.emit(clause.instrs).encode())
 
-    declared_funcrefs = list(emitter.declared_funcrefs)
-
-    # 6. Compile the first query into a separate [] -> [] function
+    # 8. Compile the first query into a separate [] -> [] function
     query_fn_idx = None
-    if queries:
-        query_instrs, _query_reg_map = queries[0]
-        q_emitter = ClauseEmitter(syms, func_indices)
-        q_wir = q_emitter.emit(query_instrs)
-        declared_funcrefs.extend(q_emitter.declared_funcrefs)
+    if program_l3.queries:
+        q = program_l3.queries[0]
+        q_emitter = ClauseEmitterL3(declared_funcrefs)
+        q_wir = q_emitter.emit(q.instrs)
 
         q_ti = len(types)
         types.append(functype([], []))
@@ -108,29 +110,25 @@ def compile(source: str) -> tuple[bytes, SymbolTable]:
         func_codes.append(q_wir.encode())
         query_fn_idx = len(func_type_indices) - 1
 
-    # 7. Build run_get(n: i32) -> i32
-    #    init(); call query; backtrack loop; return heap_val(deref(xreg[n]))
+    # 9. Build run_get(n: i32) -> i32
     rg_ti = len(types)
     types.append(functype([I32], [I32]))
 
-    # 'n' is the parameter (local index 0): which X register to return
     rg = WIR(['n'], I32)
     rg.fn_call(FN_INIT)
 
     if query_fn_idx is not None:
         rg.fn_call(query_fn_idx)
 
-        # Backtracking loop: retry until success or no more choice points
         with rg.while_loop() as loop:
-            rg.gget(G_FAIL); rg.eqz(); loop.break_if()           # success
-            rg.gget(G_B); rg.const(-1); rg.eq(); loop.break_if() # no more CPs
+            rg.gget(G_FAIL); rg.eqz(); loop.break_if()
+            rg.gget(G_B); rg.const(-1); rg.eq(); loop.break_if()
             rg.fn_call(FN_BACKTRACK_RESTORE)
             rg.gget(G_BP_STACK)
             rg.gget(G_BP_TOP); rg.const(1); rg.sub()
             rg._emit(array_get(T_CONT))
             rg.call_ref(FT_CLAUSE)
 
-    # Read xreg[n] at runtime, deref, return heap value
     rg.gget(G_XREG); rg.local('n'); rg._emit(array_get(T_XREG))
     rg.fn_call(FN_DEREF)
     rg.fn_call(FN_HEAP_GET_VAL)
@@ -139,7 +137,7 @@ def compile(source: str) -> tuple[bytes, SymbolTable]:
     func_type_indices.append(rg_ti)
     func_codes.append(rg.encode())
 
-    # 8. Assemble module
+    # 10. Assemble module
     wasm = module(
         types=types,
         funcs=func_type_indices,

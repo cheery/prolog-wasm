@@ -60,6 +60,7 @@ from prolog_parser import (
     Atom, Number, Var, Compound, List, BinOp, UnaryOp,
     Fact, Rule, Query, Program, parse,
 )
+from languages import L2
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +703,113 @@ def compile_program(program: Program):
         predicates[f"{name}/{arity}"] = pred
 
     return predicates, queries
+
+
+# ---------------------------------------------------------------------------
+# L2 conversion: WAMInstruction -> typed L2 nodes
+# ---------------------------------------------------------------------------
+
+def _wam_instr_to_l2(instr):
+    """Convert a WAMInstruction to the corresponding L2 typed node."""
+    op = instr.opcode
+    a = instr.args
+    if op == 'get_variable':
+        return L2.GetVariable(reg=a[0], ai=a[1])
+    elif op == 'get_value':
+        return L2.GetValue(reg=a[0], ai=a[1])
+    elif op == 'get_structure':
+        name, arity = a[0]
+        return L2.GetStructure(functor=name, arity=arity, ai=a[1])
+    elif op == 'get_list':
+        return L2.GetList(ai=a[0])
+    elif op == 'get_constant':
+        return L2.GetConstant(value=a[0], ai=a[1])
+    elif op == 'unify_variable':
+        return L2.UnifyVariable(reg=a[0])
+    elif op == 'unify_value':
+        return L2.UnifyValue(reg=a[0])
+    elif op == 'unify_local_value':
+        return L2.UnifyLocalValue(reg=a[0])
+    elif op == 'unify_constant':
+        return L2.UnifyConstant(value=a[0])
+    elif op == 'unify_void':
+        return L2.UnifyVoid(n=a[0])
+    elif op == 'put_variable':
+        return L2.PutVariable(reg=a[0], ai=a[1])
+    elif op == 'put_value':
+        return L2.PutValue(reg=a[0], ai=a[1])
+    elif op == 'put_unsafe_value':
+        return L2.PutUnsafeValue(reg=a[0], ai=a[1])
+    elif op == 'put_structure':
+        name, arity = a[0]
+        return L2.PutStructure(functor=name, arity=arity, ai=a[1])
+    elif op == 'put_list':
+        return L2.PutList(ai=a[0])
+    elif op == 'put_constant':
+        return L2.PutConstant(value=a[0], ai=a[1])
+    elif op == 'set_variable':
+        return L2.SetVariable(reg=a[0])
+    elif op == 'set_value':
+        return L2.SetValue(reg=a[0])
+    elif op == 'set_local_value':
+        return L2.SetLocalValue(reg=a[0])
+    elif op == 'set_constant':
+        return L2.SetConstant(value=a[0])
+    elif op == 'set_void':
+        return L2.SetVoid(n=a[0])
+    elif op == 'allocate':
+        return L2.Allocate(n=a[0])
+    elif op == 'deallocate':
+        return L2.Deallocate()
+    elif op == 'call':
+        name, arity = a[0]
+        return L2.Call(functor=name, arity=arity)
+    elif op == 'execute':
+        name, arity = a[0]
+        return L2.Execute(functor=name, arity=arity)
+    elif op == 'proceed':
+        return L2.Proceed()
+    elif op == 'try_me_else':
+        return L2.TryMeElse(next_label=a[0], arity=a[1])
+    elif op == 'retry_me_else':
+        return L2.RetryMeElse(next_label=a[0], arity=a[1])
+    elif op == 'trust_me':
+        return L2.TrustMe(arity=a[0] if a else 0)
+    elif op == 'neck_cut':
+        return L2.NeckCut()
+    elif op == 'get_level':
+        return L2.GetLevel(reg=a[0])
+    elif op == 'cut':
+        return L2.Cut(reg=a[0])
+    else:
+        raise ValueError(f"Unknown WAM opcode: {op!r}")
+
+
+def compile_program_l2(program: Program) -> 'L2.Program2':
+    """Compile a Prolog program to a Program2 (L2 typed WAM instructions).
+
+    Calls the existing compile_program(), then converts each WAMInstruction
+    to the corresponding typed L2 node.  Returns a Program2 containing
+    Predicate2 / Clause2 / Query2 nodes.
+    """
+    predicates, queries = compile_program(program)
+
+    pred_list = []
+    for _key, pred in predicates.items():
+        clauses_l2 = []
+        for label, instrs in pred.clauses:
+            l2_instrs = [_wam_instr_to_l2(i) for i in instrs]
+            clauses_l2.append(L2.Clause2(label=label, instrs=l2_instrs))
+        pred_list.append(
+            L2.Predicate2(name=pred.name, arity=pred.arity, clauses=clauses_l2)
+        )
+
+    query_list = []
+    for instrs, reg_map in queries:
+        l2_instrs = [_wam_instr_to_l2(i) for i in instrs]
+        query_list.append(L2.Query2(instrs=l2_instrs, reg_map=reg_map))
+
+    return L2.Program2(predicates=pred_list, queries=query_list)
 
 
 # ---------------------------------------------------------------------------
