@@ -23,7 +23,7 @@ from wam_wasm import (
     validate_wasm, run_wasm,
 )
 from prolog_parser import parse
-from prolog_compiler import compile_program, WAMInstruction
+from prolog_to_wam import compile_program, WAMInstruction
 from wam_emit import ClauseEmitter
 from symbols import SymbolTable
 

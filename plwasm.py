@@ -15,11 +15,7 @@ Usage:
     wasm_bytes, syms = compile(source)
     result = run_wasm(wasm_bytes, "run_get", 1)   # read X1 after query
 """
-
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'wasm'))
-
-from encoder import (
+from wasm.encoder import (
     module, functype, export_func, elem_declare, I32, array_get,
 )
 from wir import WIR
@@ -35,7 +31,7 @@ from wam_wasm import (
 )
 from prolog_parser import parse
 from normalize_pass import NormalizeLists
-from prolog_compiler import compile_program_l2
+from prolog_to_wam import compile_program_l2
 from wam_emit import ClauseEmitterL3, CompiledModule
 from symbols import SymbolTable, build_func_indices, InternSymbols
 from languages import L0, L2
