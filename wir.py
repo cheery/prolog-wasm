@@ -30,9 +30,12 @@ from encoder import (
     ref_func as _ref_func, ref_null as _ref_null,
     call_ref as _call_ref, return_call_ref as _return_call_ref,
     i32_add, i32_sub, i32_mul,
+    i32_div_s as _i32_div_s, i32_rem_s as _i32_rem_s,
     i32_and as _i32_and, i32_or as _i32_or,
     i32_eq, i32_ne, i32_eqz,
-    i32_lt_s, i32_lt_u, i32_ge_s, i32_gt_s,
+    i32_lt_s, i32_lt_u, i32_le_s as _i32_le_s,
+    i32_gt_s, i32_gt_u as _i32_gt_u,
+    i32_ge_s, i32_ge_u as _i32_ge_u,
     unreachable as _unreachable,
     func_body,
 )
@@ -41,17 +44,24 @@ from encoder import (
 class WIR:
     """WASM function body builder with named locals and structured control flow."""
 
-    def __init__(self, params, result=None):
+    def __init__(self, params, result=None, results=None):
         """
-        params: list of names for i32 parameters
-        result: None for void, I32 for i32 result
+        params:  list of names for i32 parameters
+        result:  None for void, I32 for single i32 result (legacy)
+        results: list of value types for multi-value return (overrides result)
         """
         self._instrs = []
         self._locals = {}
         self._new_locals = []     # [(count, I32), ...] for func_body
         self._next_local = len(params)
-        self._result = result
         self._depth = 0           # control-flow nesting depth for label calc
+
+        if results is not None:
+            self._results = results
+        elif result is not None:
+            self._results = [result]
+        else:
+            self._results = []
 
         for i, name in enumerate(params):
             self._locals[name] = i
@@ -128,9 +138,11 @@ class WIR:
         self._emit(_unreachable())
 
     # -- i32 arithmetic --
-    def add(self):  self._emit(i32_add())
-    def sub(self):  self._emit(i32_sub())
-    def mul(self):  self._emit(i32_mul())
+    def add(self):   self._emit(i32_add())
+    def sub(self):   self._emit(i32_sub())
+    def mul(self):   self._emit(i32_mul())
+    def div_s(self): self._emit(_i32_div_s())
+    def rem_s(self): self._emit(_i32_rem_s())
 
     # -- i32 bitwise --
     def and_(self): self._emit(_i32_and())
@@ -142,8 +154,11 @@ class WIR:
     def eqz(self):  self._emit(i32_eqz())
     def lt_s(self): self._emit(i32_lt_s())
     def lt_u(self): self._emit(i32_lt_u())
-    def ge_s(self): self._emit(i32_ge_s())
+    def le_s(self): self._emit(_i32_le_s())
     def gt_s(self): self._emit(i32_gt_s())
+    def gt_u(self): self._emit(_i32_gt_u())
+    def ge_s(self): self._emit(i32_ge_s())
+    def ge_u(self): self._emit(_i32_ge_u())
 
     # -- control flow --
     def block(self):
@@ -182,9 +197,13 @@ class WIR:
         """Context manager. Pops condition (i32); enters body if nonzero."""
         return _If(self)
 
-    def if_else(self):
-        """Context manager. Pops condition; yields (then_ir, else_ir)."""
-        return _IfElse(self)
+    def if_else(self, bt=None):
+        """Context manager. Pops condition; yields (then_ir, else_ir).
+
+        bt: block type — None for void, I32 for single i32,
+            or a type index for multi-value results.
+        """
+        return _IfElse(self, bt)
 
     # -- encode --
 
@@ -269,11 +288,12 @@ class _If:
 class _IfElse:
     """if <cond> <then> else <else> end"""
 
-    def __init__(self, wir):
+    def __init__(self, wir, bt=None):
         self.wir = wir
+        self._bt = bt
 
     def __enter__(self):
-        self.wir._emit(byte(0x04) + blocktype(None))    # if void
+        self.wir._emit(byte(0x04) + blocktype(self._bt))
         self.wir._depth += 1
         return self
 
