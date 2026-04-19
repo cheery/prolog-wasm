@@ -4,28 +4,37 @@ Parses a small language based on the LP Form from Gange et al. 2015.
 
 Syntax:
 
+    // Declarations
+    global H = 0.
+    global B = -1.
+    array HEAP.
+    array CONT: ref.
+
+    // Procedures
     gcd(a, b; ret): b != 0, mod(a, b; b'), gcd(b, b'; ret).
     gcd(a, b; a): b == 0.
 
-    fact(n; ret): fact_acc(n, 1; ret).
-    fact_acc(n, acc; ret): n > 0, mul(acc, n; acc'), sub(n, 1; n'),
-                           fact_acc(n', acc'; ret).
-    fact_acc(n, acc; acc): n == 0.
+    // Void procedures (no outputs)
+    heap_set_tag(addr, tag;):
+        mul(addr, 2; idx), aset(HEAP, idx, tag;).
 
 Rules:
   - Semicolon separates inputs from outputs in heads and goals.
   - Colon introduces the body; dot ends the clause.
-  - Variables are lowercase identifiers, optionally primed (b', n').
+  - Variables are identifiers, optionally primed (b', n').
   - Numbers are integer literals.
   - Guards are inline comparisons: ==, !=, <, <=, >, >=
   - If a head output is an input variable, it means implicit copy.
   - A clause with no body (just head and dot) is a unit clause.
+  - Built-in PrimOps: add, sub, mul, div, rem/mod, copy, neg,
+    gget, gset, aget, aset, anew, rnew.
 """
 
 from lark import Lark, Transformer, v_args
 from lp_form import (
     LPProgram, LPProc, LPClause, LPHead,
     PrimOp, Guard, Call, LPVar, LPConst,
+    GlobalDecl, ArrayDecl,
     validate, mark_tail_calls,
 )
 
@@ -35,8 +44,16 @@ from lp_form import (
 # ---------------------------------------------------------------------------
 
 LP_GRAMMAR = r"""
-    start: clause+
+    start: decl* clause+
 
+    // Declarations
+    ?decl: global_decl | array_decl
+
+    global_decl: "global" NAME "=" SIGNED_NUMBER "."
+    array_decl: "array" NAME "."
+              | "array" NAME ":" NAME "."
+
+    // Clauses
     clause: head ":" body "."   -> clause_with_body
           | head "."            -> clause_no_body
 
@@ -57,6 +74,7 @@ LP_GRAMMAR = r"""
 
     call_goal: NAME "(" args_io ")"
              | NAME "(" ")"
+             | NAME "(" ";" ")"
 
     args_io: vals ";" names       -> call_with_outputs
            | vals ";"             -> call_no_outputs
@@ -67,13 +85,13 @@ LP_GRAMMAR = r"""
     names: NAME ("," NAME)*
 
     ?val: NAME  -> var_val
-        | NUMBER -> num_val
+        | SIGNED_NUMBER -> num_val
 
     CMP: "!=" | "==" | "<=" | ">=" | "<" | ">"
 
     NAME: /[a-zA-Z_][a-zA-Z0-9_]*'*/
 
-    NUMBER: /\-?[0-9]+/
+    SIGNED_NUMBER: /\-?[0-9]+/
 
     %import common.WS
     %ignore WS
@@ -101,14 +119,25 @@ _CMP_MAP = {
 }
 
 # Built-in primitive operations (not procedure calls)
-_BUILTINS = {"add", "sub", "mul", "div", "rem", "mod", "copy", "neg"}
+_BUILTINS = {
+    "add", "sub", "mul", "div", "rem", "mod", "copy", "neg",
+    "gget", "gset", "aget", "aset", "anew", "rnew",
+    "and", "or",
+}
 
 
 @v_args(inline=True)
 class LPTransformer(Transformer):
 
-    def start(self, *clauses):
-        return list(clauses)
+    def start(self, *items):
+        return list(items)
+
+    def global_decl(self, name, value):
+        return GlobalDecl(name=str(name), initial=int(str(value)))
+
+    def array_decl(self, name, kind=None):
+        k = str(kind) if kind is not None else "i32"
+        return ArrayDecl(name=str(name), kind=k)
 
     def clause_with_body(self, head, body):
         head_info, output_copies = head
@@ -121,7 +150,6 @@ class LPTransformer(Transformer):
 
     def head(self, name, *rest):
         name = str(name)
-        # Parse inputs and outputs from rest
         inputs = []
         out_vals = []
         for item in rest:
@@ -132,22 +160,17 @@ class LPTransformer(Transformer):
                and item[0] == "__outvals__":
                 out_vals = item[1:]
 
-        # Handle output shorthand: if an output val is an input variable,
-        # generate a fresh output name and a copy goal
         output_names = []
         copy_goals = []
         for i, v in enumerate(out_vals):
             if isinstance(v, LPVar) and v.name not in inputs:
-                # It's a fresh output variable name
                 output_names.append(v.name)
             elif isinstance(v, LPVar) and v.name in inputs:
-                # Shorthand: output = input variable -> implicit copy
                 out_name = f"_ret{i}"
                 output_names.append(out_name)
                 copy_goals.append(
                     PrimOp("copy", [LPVar(v.name)], [out_name]))
             elif isinstance(v, LPConst):
-                # Shorthand: output = constant -> implicit copy
                 out_name = f"_ret{i}"
                 output_names.append(out_name)
                 copy_goals.append(
@@ -172,14 +195,13 @@ class LPTransformer(Transformer):
 
     def call_goal(self, name, *rest):
         name = str(name)
-        # rest may be empty (no args) or contain args_io result
         inputs = []
         outputs = []
         for item in rest:
             if isinstance(item, tuple):
                 inputs, outputs = item
 
-        if name in _BUILTINS or name == "mod":
+        if name in _BUILTINS:
             actual_op = name
             if actual_op == "mod":
                 actual_op = "rem"
@@ -255,11 +277,22 @@ def parse_lp(source: str, entry: str = None) -> LPProgram:
     If entry is None, the first procedure is used as the entry point.
     """
     tree = _parser.parse(source)
-    clauses = _transformer.transform(tree)
+    items = _transformer.transform(tree)
+
+    globals_ = [i for i in items if isinstance(i, GlobalDecl)]
+    arrays = [i for i in items if isinstance(i, ArrayDecl)]
+    clauses = [i for i in items if isinstance(i, LPClause)]
     procs = _group_clauses(clauses)
+
     if entry is None and procs:
         entry = procs[0].name
-    return LPProgram(procedures=procs, entry=entry)
+
+    return LPProgram(
+        procedures=procs,
+        globals=globals_,
+        arrays=arrays,
+        entry=entry,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,22 +303,30 @@ if __name__ == "__main__":
     from lp_form import pretty_print
 
     source = """
-        // GCD — the classic example from the paper
+        // GCD — the classic example
         gcd(a, b; ret): b != 0, mod(a, b; b'), gcd(b, b'; ret).
         gcd(a, b; a): b == 0.
     """
-
     prog = parse_lp(source)
     print(pretty_print(prog))
     print("---")
 
     source2 = """
-        // Factorial with accumulator
-        fact(n; ret): fact_acc(n, 1; ret).
-        fact_acc(n, acc; ret): n > 0, mul(acc, n; acc'),
-                               sub(n, 1; n'), fact_acc(n', acc'; ret).
-        fact_acc(n, acc; acc): n == 0.
-    """
+        // WAM-style heap operations
+        global H = 0.
+        array HEAP.
 
+        heap_push(tag, val; old_h):
+            gget(H; old_h),
+            mul(old_h, 2; idx),
+            aset(HEAP, idx, tag;),
+            add(idx, 1; idx1),
+            aset(HEAP, idx1, val;),
+            add(old_h, 1; new_h),
+            gset(H, new_h;).
+
+        heap_get_tag(addr; tag):
+            mul(addr, 2; idx), aget(HEAP, idx; tag).
+    """
     prog2 = parse_lp(source2)
     print(pretty_print(prog2))

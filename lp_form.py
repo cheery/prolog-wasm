@@ -12,8 +12,15 @@ LP Form is a restricted, deterministic logic programming language:
   - Loops expressed as tail recursion
   - Variables scoped to individual clauses
 
+Extended with:
+  - Global mutable i32 variables (gget/gset)
+  - Mutable i32 arrays (aget/aset/anew)
+  - Mutable funcref arrays (rget/rset/rnew) for WAM continuation/BP stacks
+  - Multi-clause compound guards
+  - Void (zero-output) procedures for side-effecting operations
+
 Grammar:
-  Prog   -> Proc*
+  Prog   -> GlobalDecl* ArrayDecl* Proc*
   Proc   -> Clause*
   Clause -> Head <- Goal*
   Head   -> Name(Var*; Var*)
@@ -43,10 +50,12 @@ class LPConst:
 
 @dataclass
 class PrimOp:
-    """Primitive arithmetic operation: op(val*; var*)."""
-    op: str              # "add", "sub", "mul", "div", "rem", "copy"
+    """Primitive arithmetic/state operation: op(val*; var*)."""
+    op: str              # "add", "sub", "mul", "div", "rem", "copy",
+                         # "gget", "gset", "aget", "aset", "anew",
+                         # "rget", "rset", "rnew"
     inputs: list         # list[LPVar | LPConst]
-    outputs: list        # list[str]
+    outputs: list        # list[str]  (may be empty for side-effecting ops)
 
 @dataclass
 class Guard:
@@ -60,8 +69,23 @@ class Call:
     """Procedure call: name(val*; var*)."""
     name: str
     inputs: list         # list[LPVar | LPConst]
-    outputs: list        # list[str]
+    outputs: list        # list[str]  (may be empty for void calls)
     is_tail: bool = False
+
+
+# -- Declarations --
+
+@dataclass
+class GlobalDecl:
+    """Global mutable i32 variable."""
+    name: str
+    initial: int = 0
+
+@dataclass
+class ArrayDecl:
+    """Named mutable array. kind is "i32" or "ref"."""
+    name: str
+    kind: str = "i32"    # "i32" for i32 arrays, "ref" for funcref arrays
 
 
 # -- Structure --
@@ -92,6 +116,8 @@ class LPProc:
 class LPProgram:
     """A complete LP Form program."""
     procedures: list     # list[LPProc]
+    globals: list = field(default_factory=list)   # list[GlobalDecl]
+    arrays: list = field(default_factory=list)    # list[ArrayDecl]
     entry: str = None    # name of entry-point procedure
 
 
@@ -103,7 +129,6 @@ def validate(program):
     Checks:
     - All clauses in a procedure have matching head signatures
     - Single assignment: each variable assigned at most once per clause
-    - Guards only appear before non-guard goals
     - Inputs are values (LPVar or LPConst), outputs are variable names
     """
     errors = []
@@ -113,6 +138,13 @@ def validate(program):
         if proc.name in proc_names:
             errors.append(f"duplicate procedure: {proc.name}")
         proc_names.add(proc.name)
+
+        # Collect declared global/array names for skipping output checks
+        declared_names = set()
+        for g in program.globals:
+            declared_names.add(g.name)
+        for a in program.arrays:
+            declared_names.add(a.name)
 
         for clause in proc.clauses:
             h = clause.head
@@ -125,20 +157,15 @@ def validate(program):
 
             # Check single assignment
             defined = set(h.inputs)  # inputs are defined on entry
-            past_guards = False
             for goal in clause.goals:
-                if isinstance(goal, Guard):
-                    if past_guards:
-                        pass  # guards can appear anywhere in principle
-                elif isinstance(goal, (PrimOp, Call)):
-                    past_guards = True
+                if isinstance(goal, (PrimOp, Call)):
                     for out in goal.outputs:
                         if out in defined:
                             errors.append(
                                 f"{proc.name}: variable '{out}' assigned twice")
                         defined.add(out)
 
-            # Check outputs are defined
+            # Check outputs are defined (skip for void procedures)
             for out in h.outputs:
                 if out not in defined:
                     errors.append(
@@ -194,6 +221,12 @@ def _fmt_goal(g):
 def pretty_print(program):
     """Return LP Form program as a human-readable string."""
     lines = []
+    for g in program.globals:
+        lines.append(f"global {g.name} = {g.initial}.")
+    for a in program.arrays:
+        lines.append(f"array {a.name}.")
+    if program.globals or program.arrays:
+        lines.append("")
     for proc in program.procedures:
         for clause in proc.clauses:
             h = clause.head
