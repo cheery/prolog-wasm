@@ -111,6 +111,7 @@ class LPProc:
     arity_out: int
     clauses: list        # list[LPClause]
     invariant: object = None  # future: CHC-inferred invariant
+    measure: object = None    # termination measure: list[str] of input names
 
 @dataclass
 class LPProgram:
