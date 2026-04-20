@@ -12,7 +12,7 @@ from lp_pipeline import lp_compile
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
 
-WASMTIME = "/home/cheery/.wasmtime/bin/wasmtime"
+WASMTIME = "wasmtime"
 
 
 def run_wasm(wasm_bytes, func_name, *args):

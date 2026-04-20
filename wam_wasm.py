@@ -731,8 +731,7 @@ def validate_wasm(wasm_bytes, label):
         f.write(wasm_bytes)
     try:
         r = subprocess.run(
-            ["/home/cheery/.wasmtime/bin/wasmtime", "compile",
-             "-W", "all-proposals=y", path],
+            ["wasmtime", "compile", "-W", "all-proposals=y", path],
             capture_output=True, text=True,
         )
         if r.returncode != 0:
@@ -751,7 +750,7 @@ def run_wasm(wasm_bytes, func_name, *args):
         f.write(wasm_bytes)
     try:
         cmd = [
-            "/home/cheery/.wasmtime/bin/wasmtime",
+            "wasmtime",
             "-W", "all-proposals=y",
             "--invoke", func_name, path,
         ] + [str(a) for a in args]

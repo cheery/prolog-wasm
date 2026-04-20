@@ -21,7 +21,7 @@ from encoder import *
 # Validation helpers
 # ---------------------------------------------------------------------------
 
-WASMTIME = shutil.which("wasmtime") or "/home/cheery/.wasmtime/bin/wasmtime"
+WASMTIME = "wasmtime"
 
 
 def _to_temp_file(wasm_bytes: bytes) -> str:
