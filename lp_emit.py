@@ -16,7 +16,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'wasm'))
 
 from encoder import (
-    module, functype, export_func, I32,
+    module, functype, export_func, export_global, I32,
     comptype_array, subtype, reftype, byte as enc_byte,
     global_entry, i32_const, ref_null,
     array_new_default, array_get, array_set,
@@ -27,6 +27,16 @@ from lp_form import (
     PrimOp, Guard, Call, LPVar, LPConst,
     GlobalDecl, ArrayDecl,
 )
+
+
+# Reserved names for trace instrumentation internals.
+_TRACE_TMP_LOCAL = "__trace_tmp__"
+_TRACE_BUF_NAME = "__trace_buf"
+_TRACE_TOP_NAME = "__trace_top"
+_TRACE_INIT_NAME = "__trace_init"
+_TRACE_LEN_NAME = "__trace_len"
+_TRACE_GET_NAME = "__trace_get"
+_TRACE_RESET_NAME = "__trace_reset"
 
 
 # PrimOp -> WIR method name (for binary arithmetic)
@@ -52,7 +62,22 @@ _GUARD_MAP = {
 
 
 class LPEmitter:
-    """Compile an LPProgram to WASM module bytes."""
+    """Compile an LPProgram to WASM module bytes.
+
+    Parameters
+    ----------
+    trace : bool
+        When True, emit trace-buffer writes before each clause's body.
+        Each trace record is: [size, proc_id, clause_idx, input_0, ...].
+        Exports: __trace_init(), __trace_reset(), __trace_len() -> i32,
+        __trace_get(idx: i32) -> i32, and global __trace_top.
+    trace_size : int
+        Capacity of the trace buffer in i32 cells (default 1M).
+    """
+
+    def __init__(self, trace: bool = False, trace_size: int = 1 << 20):
+        self.trace = trace
+        self.trace_size = trace_size
 
     def compile(self, program: LPProgram) -> bytes:
         self._program = program
@@ -78,6 +103,11 @@ class LPEmitter:
                             + enc_byte(0x01)))
             self._array_type_indices[arr.name] = ti
 
+        # Trace buffer array type (i32 array)
+        if self.trace:
+            self._trace_array_ti = len(self._types)
+            self._types.append(subtype(comptype_array((I32, True))))
+
         # --- Allocate WASM globals ---
         self._globals = []
         self._global_indices = {}  # global_name -> WASM global index
@@ -98,7 +128,19 @@ class LPEmitter:
                 global_entry(reftype(True, ti), True, [ref_null(ti)]))
             self._array_global_indices[arr.name] = gi
 
+        # Trace buffer globals: ref to the i32 array, plus write head
+        if self.trace:
+            self._trace_buf_gi = len(self._globals)
+            self._globals.append(global_entry(
+                reftype(True, self._trace_array_ti), True,
+                [ref_null(self._trace_array_ti)]))
+            self._trace_top_gi = len(self._globals)
+            self._globals.append(global_entry(
+                I32, True, [i32_const(0)]))
+
         # --- Build procedure index ---
+        # Proc ids (used as trace record tags) start at 0 and match the
+        # WASM function index for user procedures.
         self._proc_index = {}  # proc_name -> WASM function index
         for i, proc in enumerate(program.procedures):
             self._proc_index[proc.name] = i
@@ -117,8 +159,33 @@ class LPEmitter:
             code = self._compile_proc(proc)
             func_codes.append(code)
 
-        # --- Build entry wrapper if specified ---
+        # --- Trace helper functions ---
         exports = []
+        trace_init_idx = None
+        if self.trace:
+            trace_init_idx = len(func_type_indices)
+            func_type_indices.append(self._ensure_functype([], []))
+            func_codes.append(self._build_trace_init())
+            exports.append(export_func(_TRACE_INIT_NAME, trace_init_idx))
+
+            trace_reset_idx = len(func_type_indices)
+            func_type_indices.append(self._ensure_functype([], []))
+            func_codes.append(self._build_trace_reset())
+            exports.append(export_func(_TRACE_RESET_NAME, trace_reset_idx))
+
+            trace_len_idx = len(func_type_indices)
+            func_type_indices.append(self._ensure_functype([], [I32]))
+            func_codes.append(self._build_trace_len())
+            exports.append(export_func(_TRACE_LEN_NAME, trace_len_idx))
+
+            trace_get_idx = len(func_type_indices)
+            func_type_indices.append(self._ensure_functype([I32], [I32]))
+            func_codes.append(self._build_trace_get())
+            exports.append(export_func(_TRACE_GET_NAME, trace_get_idx))
+
+            exports.append(export_global(_TRACE_TOP_NAME, self._trace_top_gi))
+
+        # --- Build entry wrapper if specified ---
         if program.entry:
             entry_proc = None
             for proc in program.procedures:
@@ -132,6 +199,10 @@ class LPEmitter:
                     [I32] * entry_proc.arity_out)
                 params = [f"p{i}" for i in range(entry_proc.arity_in)]
                 ir = WIR(params, results=[I32] * entry_proc.arity_out)
+                # Auto-initialize the trace buffer on each top-level call so
+                # repeated invocations start from a clean trace.
+                if self.trace:
+                    ir.fn_call(trace_init_idx)
                 for p in params:
                     ir.local(p)
                 ir.return_call(self._proc_index[program.entry])
@@ -167,6 +238,8 @@ class LPEmitter:
     # -----------------------------------------------------------------
 
     def _compile_proc(self, proc: LPProc) -> bytes:
+        self._cur_proc = proc
+        self._cur_proc_id = self._proc_index[proc.name]
         if len(proc.clauses) == 1:
             return self._compile_single_clause(proc, proc.clauses[0])
         else:
@@ -176,12 +249,19 @@ class LPEmitter:
         params = list(clause.head.inputs)
         ir = WIR(params, results=[I32] * proc.arity_out)
 
+        if self.trace:
+            ir.new_local(_TRACE_TMP_LOCAL)
+
         all_vars = self._collect_clause_vars(clause)
         for v in all_vars:
             if v not in clause.head.inputs:
                 ir.new_local(v)
 
         var_map = {v: v for v in all_vars}
+
+        if self.trace:
+            self._emit_trace_append(
+                ir, self._cur_proc_id, 0, clause.head.inputs, var_map)
 
         self._emit_goals_all(ir, clause.goals, clause.head, var_map)
 
@@ -195,6 +275,9 @@ class LPEmitter:
     def _compile_multi_clause(self, proc):
         params = list(proc.clauses[0].head.inputs)
         ir = WIR(params, results=[I32] * proc.arity_out)
+
+        if self.trace:
+            ir.new_local(_TRACE_TMP_LOCAL)
 
         # Declare locals for all clauses (prefixed by clause index)
         clause_var_maps = []
@@ -242,7 +325,12 @@ class LPEmitter:
         is_last = (idx == len(proc.clauses) - 1)
 
         if is_last:
-            # Last clause: no guard check, just execute everything
+            # Last clause: no guard check, just execute everything.
+            # Trace fires unconditionally since this clause is the fallback.
+            if self.trace:
+                self._emit_trace_append(
+                    ir, self._cur_proc_id, idx,
+                    clause.head.inputs, var_map)
             self._emit_goals_all(ir, clause.goals, clause.head, var_map)
             if not self._ends_with_tail_call(clause.goals):
                 for out in clause.head.outputs:
@@ -257,6 +345,10 @@ class LPEmitter:
 
         if last_guard_idx == -1:
             # No guards but not last clause — emit everything
+            if self.trace:
+                self._emit_trace_append(
+                    ir, self._cur_proc_id, idx,
+                    clause.head.inputs, var_map)
             self._emit_goals_all(ir, clause.goals, clause.head, var_map)
             if not self._ends_with_tail_call(clause.goals):
                 for out in clause.head.outputs:
@@ -286,9 +378,13 @@ class LPEmitter:
             ir.local(gl)
             ir.and_()
 
-        # if guards hold: execute suffix + push outputs
+        # if guards hold: trace + execute suffix + push outputs
         # else: try next clause
         with ir.if_else(result_bt) as ie:
+            if self.trace:
+                self._emit_trace_append(
+                    ir, self._cur_proc_id, idx,
+                    clause.head.inputs, var_map)
             for goal in suffix:
                 self._emit_one_goal(ir, goal, var_map)
             if not self._ends_with_tail_call(suffix):
@@ -434,3 +530,94 @@ class LPEmitter:
                         vs.add(inp.name)
                 vs.update(goal.outputs)
         return vs
+
+    # -----------------------------------------------------------------
+    # Trace instrumentation
+    # -----------------------------------------------------------------
+
+    def _emit_trace_append(self, ir, proc_id, clause_idx,
+                           input_names, var_map):
+        """Append a variable-length record to the trace buffer.
+
+        Record layout at buf[top .. top+size]:
+            buf[top+0]   = payload_size            (2 + arity_in)
+            buf[top+1]   = proc_id
+            buf[top+2]   = clause_idx
+            buf[top+3+i] = input_i (for i in range(arity_in))
+        Then top advances by 1 + payload_size.
+        """
+        payload_size = 2 + len(input_names)
+        arr_ti = self._trace_array_ti
+        buf_gi = self._trace_buf_gi
+        top_gi = self._trace_top_gi
+
+        # tmp = top
+        ir.gget(top_gi)
+        ir.set(_TRACE_TMP_LOCAL)
+
+        # buf[tmp] = payload_size
+        ir.gget(buf_gi)
+        ir.local(_TRACE_TMP_LOCAL)
+        ir.const(payload_size)
+        ir._emit(array_set(arr_ti))
+
+        # buf[tmp+1] = proc_id
+        ir.gget(buf_gi)
+        ir.local(_TRACE_TMP_LOCAL)
+        ir.const(1)
+        ir.add()
+        ir.const(proc_id)
+        ir._emit(array_set(arr_ti))
+
+        # buf[tmp+2] = clause_idx
+        ir.gget(buf_gi)
+        ir.local(_TRACE_TMP_LOCAL)
+        ir.const(2)
+        ir.add()
+        ir.const(clause_idx)
+        ir._emit(array_set(arr_ti))
+
+        for i, name in enumerate(input_names):
+            ir.gget(buf_gi)
+            ir.local(_TRACE_TMP_LOCAL)
+            ir.const(3 + i)
+            ir.add()
+            ir.local(var_map[name])
+            ir._emit(array_set(arr_ti))
+
+        # top = tmp + 1 + payload_size
+        ir.local(_TRACE_TMP_LOCAL)
+        ir.const(1 + payload_size)
+        ir.add()
+        ir.gset(top_gi)
+
+    def _build_trace_init(self):
+        """Allocate a fresh trace buffer and reset the write head."""
+        ir = WIR([], results=[])
+        ir.const(self.trace_size)
+        ir._emit(array_new_default(self._trace_array_ti))
+        ir.gset(self._trace_buf_gi)
+        ir.const(0)
+        ir.gset(self._trace_top_gi)
+        return ir.encode()
+
+    def _build_trace_reset(self):
+        """Reset the trace write head without reallocating the buffer."""
+        ir = WIR([], results=[])
+        ir.const(0)
+        ir.gset(self._trace_top_gi)
+        return ir.encode()
+
+    def _build_trace_len(self):
+        """Return the current write head (number of i32 cells written)."""
+        ir = WIR([], results=[I32])
+        ir.gget(self._trace_top_gi)
+        return ir.encode()
+
+    def _build_trace_get(self):
+        """Read a single i32 cell from the trace buffer."""
+        ir = WIR(['idx'], results=[I32])
+        ir.gget(self._trace_buf_gi)
+        ir.local('idx')
+        ir._emit(array_get(self._trace_array_ti))
+        return ir.encode()
