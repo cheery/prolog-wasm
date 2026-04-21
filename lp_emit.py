@@ -17,15 +17,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'wasm'))
 
 from encoder import (
     module, functype, export_func, export_global, I32,
-    comptype_array, subtype, reftype, byte as enc_byte,
+    comptype_array, comptype_struct, subtype, reftype,
+    byte as enc_byte,
     global_entry, i32_const, ref_null,
     array_new_default, array_get, array_set,
+    struct_new as _struct_new, struct_get as _struct_get,
 )
 from wir import WIR
 from lp_form import (
     LPProgram, LPProc, LPClause, LPHead,
-    PrimOp, Guard, Call, LPVar, LPConst,
-    GlobalDecl, ArrayDecl,
+    PrimOp, Guard, Call, LPVar, LPConst, LPFieldAccess, LPPattern,
+    GlobalDecl, ArrayDecl, LPStructDecl, LPSumDecl,
 )
 
 
@@ -104,6 +106,31 @@ class LPEmitter:
                             + reftype(True, ft_idx)
                             + enc_byte(0x01)))
             self._array_type_indices[arr.name] = ti
+
+        # Struct types for declared structs and sum types
+        # Layout: all fields are (i32, True) — mutable i32
+        self._struct_type_indices = {}  # type_name -> WASM type index
+        self._struct_field_count = {}   # type_name -> int (number of fields)
+        self._struct_layouts = {}       # type_name -> list of field names
+
+        for s in program.structs:
+            ti = len(self._types)
+            fields = [(I32, True)] * len(s.fields)
+            self._types.append(subtype(comptype_struct(fields)))
+            self._struct_type_indices[s.name] = ti
+            self._struct_field_count[s.name] = len(s.fields)
+            self._struct_layouts[s.name] = [fn for fn, _ft in s.fields]
+
+        for s in program.sums:
+            ti = len(self._types)
+            max_params = max(len(c.params) for c in s.constructors)
+            # tag field + payload fields
+            fields = [(I32, True)] * (1 + max_params)
+            self._types.append(subtype(comptype_struct(fields)))
+            self._struct_type_indices[s.name] = ti
+            self._struct_field_count[s.name] = 1 + max_params
+            self._struct_layouts[s.name] = (
+                ["__tag"] + [f"_f{i}" for i in range(max_params)])
 
         # Trace buffer array type (i32 array)
         if self.trace:
@@ -278,9 +305,14 @@ class LPEmitter:
             ir.new_local(_TRACE_TMP_LOCAL)
 
         all_vars = self._collect_clause_vars(clause)
+        struct_vars = self._infer_struct_locals(clause)
         for v in all_vars:
             if v not in clause.head.inputs:
-                ir.new_local(v)
+                if v in struct_vars:
+                    ti = self._struct_type_indices[struct_vars[v]]
+                    ir.new_local_ref(v, reftype(True, ti))
+                else:
+                    ir.new_local(v)
 
         var_map = {v: v for v in all_vars}
 
@@ -311,13 +343,18 @@ class LPEmitter:
             for v in clause.head.inputs:
                 var_map[v] = v
             all_vars = self._collect_clause_vars(clause)
+            struct_vars = self._infer_struct_locals(clause)
             for v in all_vars:
                 if v in clause.head.inputs:
                     var_map[v] = v
                 else:
                     unique = f"_c{ci}_{v}"
                     var_map[v] = unique
-                    ir.new_local(unique)
+                    if v in struct_vars:
+                        ti = self._struct_type_indices[struct_vars[v]]
+                        ir.new_local_ref(unique, reftype(True, ti))
+                    else:
+                        ir.new_local(unique)
             clause_var_maps.append(var_map)
 
         # Block type for if-else that produces results
@@ -505,6 +542,43 @@ class LPEmitter:
             getattr(ir, _ARITH_MAP[op.op])()
             ir.set(var_map[op.outputs[0]])
 
+        elif op.op == "struct_new":
+            # struct_new(Type, val1, val2, ...; result)
+            # First input is the type name, rest are field values
+            type_name = op.inputs[0].name
+            ti = self._struct_type_indices[type_name]
+            n_fields = self._struct_field_count[type_name]
+            # Push all field values, padding with 0 if needed
+            fields_in = op.inputs[1:]
+            for i in range(n_fields):
+                if i < len(fields_in):
+                    self._emit_val(ir, fields_in[i], var_map)
+                else:
+                    ir.const(0)
+            ir._emit(_struct_new(ti))
+            ir.set(var_map[op.outputs[0]])
+
+        elif op.op == "struct_get":
+            # struct_get(val; result) with meta={"type": ..., "index": ...}
+            # Or legacy form: struct_get(Type, val, field; result)
+            if op.meta and "index" in op.meta:
+                self._emit_val(ir, op.inputs[0], var_map)
+                type_name = op.meta["type"]
+                ti = self._struct_type_indices[type_name]
+                field_idx = op.meta["index"]
+                ir._emit(_struct_get(ti, field_idx))
+                ir.set(var_map[op.outputs[0]])
+            else:
+                # Legacy 3-arg form: struct_get(Type, val, field; result)
+                type_name = op.inputs[0].name
+                ti = self._struct_type_indices[type_name]
+                self._emit_val(ir, op.inputs[1], var_map)
+                field_name = op.inputs[2].name if isinstance(op.inputs[2], LPVar) else str(op.inputs[2].value)
+                layout = self._struct_layouts[type_name]
+                field_idx = layout.index(field_name) if field_name in layout else int(field_name)
+                ir._emit(_struct_get(ti, field_idx))
+                ir.set(var_map[op.outputs[0]])
+
         else:
             raise ValueError(f"unknown PrimOp: {op.op}")
 
@@ -520,6 +594,10 @@ class LPEmitter:
             ir.fn_call(fn_idx)
             # Capture outputs (multi-value: first result deepest on stack)
             for out in reversed(call.outputs):
+                if isinstance(out, LPPattern):
+                    raise ValueError(
+                        f"LPPattern in call outputs reached emitter — "
+                        f"run elaboration first: {out}")
                 ir.set(var_map[out])
 
     def _emit_val(self, ir, val, var_map):
@@ -527,6 +605,10 @@ class LPEmitter:
             ir.local(var_map[val.name])
         elif isinstance(val, LPConst):
             ir.const(val.value)
+        elif isinstance(val, LPFieldAccess):
+            raise ValueError(
+                f"LPFieldAccess reached emitter — run elaboration first: "
+                f"{val.expr}.{val.field}")
         else:
             raise ValueError(f"unexpected value: {val}")
 
@@ -540,21 +622,66 @@ class LPEmitter:
         last = goals[-1]
         return isinstance(last, Call) and last.is_tail
 
+    def _infer_struct_locals(self, clause):
+        """Return {var_name: struct_type_name} for variables that hold
+        struct refs within this clause.
+
+        Only struct_new outputs are classified: those produce WASM GC
+        struct refs that must live in ref-typed locals. Variables that
+        ultimately flow from other sources (e.g. procedure outputs that
+        return struct refs) are not handled here — cross-procedure
+        struct-return requires signature typing, a future extension.
+        """
+        struct_vars = {}
+        for goal in clause.goals:
+            if isinstance(goal, PrimOp) and goal.op == "struct_new":
+                type_name = goal.inputs[0].name
+                if type_name in self._struct_type_indices:
+                    for out in goal.outputs:
+                        struct_vars[out] = type_name
+        return struct_vars
+
     def _collect_clause_vars(self, clause):
         vs = set(clause.head.inputs)
         vs.update(clause.head.outputs)
         for goal in clause.goals:
             if isinstance(goal, Guard):
-                if isinstance(goal.left, LPVar):
-                    vs.add(goal.left.name)
-                if isinstance(goal.right, LPVar):
-                    vs.add(goal.right.name)
-            elif isinstance(goal, (PrimOp, Call)):
+                self._collect_vars_from_val(goal.left, vs)
+                self._collect_vars_from_val(goal.right, vs)
+            elif isinstance(goal, PrimOp):
+                # struct_new's first input is the type name, not a var;
+                # similarly for the gget/gset/aget/aset/... family, the
+                # first input is a global/array name.
+                skip_first = goal.op in {
+                    "struct_new", "gget", "gset",
+                    "aget", "aset", "anew",
+                    "rget", "rset", "rnew",
+                }
+                for i, inp in enumerate(goal.inputs):
+                    if skip_first and i == 0:
+                        continue
+                    self._collect_vars_from_val(inp, vs)
+                for out in goal.outputs:
+                    if isinstance(out, LPPattern):
+                        vs.update(out.vars)
+                    else:
+                        vs.add(out)
+            elif isinstance(goal, Call):
                 for inp in goal.inputs:
-                    if isinstance(inp, LPVar):
-                        vs.add(inp.name)
-                vs.update(goal.outputs)
+                    self._collect_vars_from_val(inp, vs)
+                for out in goal.outputs:
+                    if isinstance(out, LPPattern):
+                        vs.update(out.vars)
+                    else:
+                        vs.add(out)
         return vs
+
+    @staticmethod
+    def _collect_vars_from_val(v, vs):
+        if isinstance(v, LPVar):
+            vs.add(v.name)
+        elif isinstance(v, LPFieldAccess):
+            LPEmitter._collect_vars_from_val(v.expr, vs)
 
     # -----------------------------------------------------------------
     # Trace instrumentation

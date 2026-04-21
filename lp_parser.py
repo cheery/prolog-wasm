@@ -33,7 +33,9 @@ Rules:
 from lark import Lark, Transformer, v_args
 from lp_form import (
     LPProgram, LPProc, LPClause, LPHead,
-    PrimOp, Guard, Call, LPVar, LPConst,
+    PrimOp, Guard, Call, LPVar, LPConst, LPFieldAccess, LPPattern,
+    LPStructDecl, LPConstructor, LPSumDecl,
+    LPADT, LPSignature,
     GlobalDecl, ArrayDecl,
     validate, mark_tail_calls,
 )
@@ -47,11 +49,34 @@ LP_GRAMMAR = r"""
     start: decl* clause+
 
     // Declarations
-    ?decl: global_decl | array_decl
+    ?decl: global_decl | array_decl | struct_decl | type_decl | adt_decl
 
     global_decl: "global" NAME "=" SIGNED_NUMBER "."
     array_decl: "array" NAME "."
               | "array" NAME ":" NAME "."
+
+    // Type declarations
+    struct_decl: "struct" NAME "{" field_list "}" "."
+    type_decl: "type" NAME "=" ctor_list "."
+
+    // Abstract data type declarations
+    adt_decl: "adt" NAME "{" sig_list "}" "."
+
+    sig_list: sig*
+    sig: NAME "(" in_params ";" sig_out_params ")"
+       | NAME "(" ";" sig_out_params ")"
+       | NAME "(" in_params ";" ")"
+       | NAME "(" ";" ")"
+
+    sig_out_params: NAME ("," NAME)*
+
+    field_list: field ("," field)*
+    field: NAME ":" NAME
+
+    ctor_list: ctor ("|" ctor)*
+    ctor: NAME "(" type_list ")" | NAME
+
+    type_list: NAME ("," NAME)*
 
     // Clauses
     clause: head ":" body "."   -> clause_with_body
@@ -76,16 +101,24 @@ LP_GRAMMAR = r"""
              | NAME "(" ")"
              | NAME "(" ";" ")"
 
-    args_io: vals ";" names       -> call_with_outputs
-           | vals ";"             -> call_no_outputs
-           | ";" names            -> call_no_inputs
-           | vals                 -> call_inputs_only
+    args_io: vals ";" out_names    -> call_with_outputs
+           | vals ";"              -> call_no_outputs
+           | ";" out_names         -> call_no_inputs
+           | vals                  -> call_inputs_only
 
     vals: val ("," val)*
-    names: NAME ("," NAME)*
+
+    // Output names: plain variables or constructor patterns
+    out_names: out_name ("," out_name)*
+
+    ?out_name: NAME "(" out_var_list ")" -> ctor_out_pattern
+             | NAME                      -> plain_out_name
+
+    out_var_list: NAME ("," NAME)* | -> empty_vars
 
     ?val: NAME  -> var_val
         | SIGNED_NUMBER -> num_val
+        | NAME "." NAME -> field_access
 
     CMP: "!=" | "==" | "<=" | ">=" | "<" | ">"
 
@@ -123,6 +156,7 @@ _BUILTINS = {
     "add", "sub", "mul", "div", "rem", "mod", "copy", "neg",
     "gget", "gset", "aget", "aset", "anew", "rnew",
     "and", "or",
+    "struct_new", "struct_get",
 }
 
 
@@ -138,6 +172,57 @@ class LPTransformer(Transformer):
     def array_decl(self, name, kind=None):
         k = str(kind) if kind is not None else "i32"
         return ArrayDecl(name=str(name), kind=k)
+
+    def struct_decl(self, name, fields):
+        field_list = [(str(fn), str(ft)) for fn, ft in fields]
+        return LPStructDecl(name=str(name), fields=field_list)
+
+    def type_decl(self, name, ctors):
+        return LPSumDecl(name=str(name), constructors=list(ctors))
+
+    def adt_decl(self, name, sigs):
+        return LPADT(name=str(name), signatures=list(sigs))
+
+    def sig_list(self, *sigs):
+        return list(sigs)
+
+    def sig(self, name, *rest):
+        name = str(name)
+        arity_in = 0
+        arity_out = 0
+        for item in rest:
+            if isinstance(item, list) and item and isinstance(item[0], str) \
+               and item[0] == "__inputs__":
+                arity_in = len(item) - 1
+            elif isinstance(item, list) and item and isinstance(item[0], str) \
+                 and item[0] == "__sig_outs__":
+                arity_out = len(item) - 1
+        return LPSignature(name=name, arity_in=arity_in, arity_out=arity_out)
+
+    def sig_out_params(self, *names):
+        return ["__sig_outs__"] + [str(n) for n in names]
+
+    def field_list(self, *fields):
+        return list(fields)
+
+    def field(self, name, typ):
+        return (name, typ)
+
+    def ctor_list(self, *ctors):
+        return list(ctors)
+
+    def ctor(self, name, *rest):
+        params = []
+        for r in rest:
+            if isinstance(r, list):
+                params = [str(t) for t in r]
+        return LPConstructor(name=str(name), params=params)
+
+    def type_list(self, *names):
+        return list(names)
+
+    def empty_vars(self, ):
+        return []
 
     def clause_with_body(self, head, body):
         head_info, output_copies = head
@@ -227,11 +312,30 @@ class LPTransformer(Transformer):
     def names(self, *ns):
         return [str(n) for n in ns]
 
+    def out_names(self, *ns):
+        return list(ns)
+
+    def plain_out_name(self, token):
+        return str(token)
+
+    def ctor_out_pattern(self, ctor, *rest):
+        vars_ = []
+        for r in rest:
+            if isinstance(r, list):
+                vars_ = [str(v) for v in r]
+        return LPPattern(ctor=str(ctor), vars=vars_)
+
+    def out_var_list(self, *ns):
+        return [str(n) for n in ns]
+
     def var_val(self, token):
         return LPVar(str(token))
 
     def num_val(self, token):
         return LPConst(int(str(token)))
+
+    def field_access(self, obj, field):
+        return LPFieldAccess(LPVar(str(obj)), str(field))
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +385,9 @@ def parse_lp(source: str, entry: str = None) -> LPProgram:
 
     globals_ = [i for i in items if isinstance(i, GlobalDecl)]
     arrays = [i for i in items if isinstance(i, ArrayDecl)]
+    structs = [i for i in items if isinstance(i, LPStructDecl)]
+    sums = [i for i in items if isinstance(i, LPSumDecl)]
+    adts = [i for i in items if isinstance(i, LPADT)]
     clauses = [i for i in items if isinstance(i, LPClause)]
     procs = _group_clauses(clauses)
 
@@ -291,6 +398,9 @@ def parse_lp(source: str, entry: str = None) -> LPProgram:
         procedures=procs,
         globals=globals_,
         arrays=arrays,
+        structs=structs,
+        sums=sums,
+        adts=adts,
         entry=entry,
     )
 

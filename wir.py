@@ -74,6 +74,14 @@ class WIR:
         self._new_locals.append((1, I32))
         return idx
 
+    def new_local_ref(self, name, type_bytes):
+        """Declare a new ref-typed local. Returns its index."""
+        idx = self._next_local
+        self._next_local += 1
+        self._locals[name] = idx
+        self._new_locals.append((1, type_bytes))
+        return idx
+
     # -- emit raw bytes --
     def _emit(self, b: bytes):
         self._instrs.append(b)

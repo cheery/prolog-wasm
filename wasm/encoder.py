@@ -1498,12 +1498,18 @@ def data_active_mem(memidx: int, offset_instrs, data_bytes) -> bytes:
 def func_body(locals_, instrs) -> bytes:
     """Encode a function body (code entry).
 
-    locals_: list of (count, valtype) tuples for local declarations
+    locals_: list of (count, valtype) tuples for local declarations.
+    valtype may be either an int (single-byte numeric type) or raw
+    bytes (for reftypes, which are multi-byte).
     instrs: list of instruction bytes
 
     The body is size-prefixed per the Bcode grammar.
     """
-    encoded_locals = vec(locals_, lambda l: u32(l[0]) + byte(l[1]))
+    def _enc_local(l):
+        count, vt = l
+        vt_bytes = vt if isinstance(vt, (bytes, bytearray)) else byte(vt)
+        return u32(count) + vt_bytes
+    encoded_locals = vec(locals_, _enc_local)
     encoded_expr = b''.join(instrs) + byte(0x0B)
     body = encoded_locals + encoded_expr
     return u32(len(body)) + body

@@ -45,6 +45,12 @@ class LPConst:
     """An integer constant."""
     value: int
 
+@dataclass
+class LPFieldAccess:
+    """Field access on a structured value: expr.field_name."""
+    expr: object         # LPVar | LPConst | LPFieldAccess
+    field: str
+
 
 # -- Goals (clause body elements) --
 
@@ -53,27 +59,85 @@ class PrimOp:
     """Primitive arithmetic/state operation: op(val*; var*)."""
     op: str              # "add", "sub", "mul", "div", "rem", "copy",
                          # "gget", "gset", "aget", "aset", "anew",
-                         # "rget", "rset", "rnew"
+                         # "rget", "rset", "rnew",
+                         # "struct_new", "struct_get"
     inputs: list         # list[LPVar | LPConst]
     outputs: list        # list[str]  (may be empty for side-effecting ops)
+    meta: dict = None    # optional: {"type": "Cell", "field": "tag"} etc.
 
 @dataclass
 class Guard:
     """Comparison guard: cmp(val, val;) — no outputs, must hold for clause."""
     op: str              # "eq", "ne", "lt", "le", "gt", "ge"
-    left: object         # LPVar | LPConst
-    right: object        # LPVar | LPConst
+    left: object         # LPVar | LPConst | LPFieldAccess
+    right: object        # LPVar | LPConst | LPFieldAccess
 
 @dataclass
 class Call:
     """Procedure call: name(val*; var*)."""
     name: str
     inputs: list         # list[LPVar | LPConst]
-    outputs: list        # list[str]  (may be empty for void calls)
+    outputs: list        # list[str | LPPattern]
     is_tail: bool = False
 
 
-# -- Declarations --
+# -- Patterns (constructor patterns in call output positions) --
+
+@dataclass
+class LPPattern:
+    """Constructor pattern in a call output: ctor(var1, var2, ...) or _."""
+    ctor: str            # constructor name, or "_" for wildcard
+    vars: list           # list[str] — bound variable names
+
+
+# -- Type Declarations --
+
+@dataclass
+class LPStructDecl:
+    """A struct type: struct Name { field: Type, ... }"""
+    name: str
+    fields: list         # list[tuple[str, str]] — (field_name, field_type)
+
+@dataclass
+class LPConstructor:
+    """A constructor of a sum type: Ctor(Type, Type, ...)"""
+    name: str
+    params: list         # list[str] — parameter type names
+
+@dataclass
+class LPSumDecl:
+    """A sum type: type Name = Ctor1(Types) | Ctor2(Types) | ..."""
+    name: str
+    constructors: list   # list[LPConstructor]
+
+
+@dataclass
+class LPSignature:
+    """An ADT operation signature: name(arity_in; arity_out)."""
+    name: str
+    arity_in: int
+    arity_out: int
+
+@dataclass
+class LPADT:
+    """An abstract data type: adt Name { sig1; sig2; ... }.
+
+    An ADT is a logical interface: each signature names an operation of
+    the ADT with an input/output arity. The procedures implementing the
+    ADT live in the program's regular procedure list; the ADT block is
+    validated against those procedures' actual arities.
+
+    Rationale: ADTs exist to (a) document the interface boundary for
+    modular verification, and (b) eventually carry compiler hints for
+    the dual WASM/CHC projection described in DT-PLAN.md. For now the
+    block is descriptive — the emitter and CHC extractor use the
+    procedures directly.
+    """
+    name: str
+    signatures: list     # list[LPSignature]
+
+
+# -- State Declarations --
 
 @dataclass
 class GlobalDecl:
@@ -122,6 +186,9 @@ class LPProgram:
     procedures: list     # list[LPProc]
     globals: list = field(default_factory=list)   # list[GlobalDecl]
     arrays: list = field(default_factory=list)    # list[ArrayDecl]
+    structs: list = field(default_factory=list)   # list[LPStructDecl]
+    sums: list = field(default_factory=list)      # list[LPSumDecl]
+    adts: list = field(default_factory=list)      # list[LPADT]
     entry: str = None    # name of entry-point procedure
 
     def link(self, other: "LPProgram") -> "LPProgram":
@@ -166,10 +233,37 @@ class LPProgram:
                 merged_arrays.append(a)
                 my_arrays[a.name] = a
 
+        my_structs = {s.name: s for s in self.structs}
+        merged_structs = list(self.structs)
+        for s in other.structs:
+            if s.name in my_structs:
+                raise ValueError(
+                    f"link: duplicate struct '{s.name}'")
+            merged_structs.append(s)
+
+        my_sums = {s.name: s for s in self.sums}
+        merged_sums = list(self.sums)
+        for s in other.sums:
+            if s.name in my_sums:
+                raise ValueError(
+                    f"link: duplicate sum type '{s.name}'")
+            merged_sums.append(s)
+
+        my_adts = {a.name: a for a in self.adts}
+        merged_adts = list(self.adts)
+        for a in other.adts:
+            if a.name in my_adts:
+                raise ValueError(
+                    f"link: duplicate adt '{a.name}'")
+            merged_adts.append(a)
+
         return LPProgram(
             procedures=list(self.procedures) + list(other.procedures),
             globals=merged_globals,
             arrays=merged_arrays,
+            structs=merged_structs,
+            sums=merged_sums,
+            adts=merged_adts,
             entry=self.entry,
         )
 
@@ -213,10 +307,19 @@ def validate(program):
             for goal in clause.goals:
                 if isinstance(goal, (PrimOp, Call)):
                     for out in goal.outputs:
-                        if out in defined:
-                            errors.append(
-                                f"{proc.name}: variable '{out}' assigned twice")
-                        defined.add(out)
+                        if isinstance(out, LPPattern):
+                            for v in out.vars:
+                                if v in defined:
+                                    errors.append(
+                                        f"{proc.name}: variable '{v}' "
+                                        f"assigned twice")
+                                defined.add(v)
+                        else:
+                            if out in defined:
+                                errors.append(
+                                    f"{proc.name}: variable '{out}' "
+                                    f"assigned twice")
+                            defined.add(out)
 
             # Check outputs are defined (skip for void procedures)
             for out in h.outputs:
@@ -224,12 +327,40 @@ def validate(program):
                     errors.append(
                         f"{proc.name}: output '{out}' never defined")
 
+    # ADT signatures must match implementing procedures.
+    proc_sigs = {p.name: (p.arity_in, p.arity_out)
+                 for p in program.procedures}
+    for adt in getattr(program, "adts", []) or []:
+        for sig in adt.signatures:
+            actual = proc_sigs.get(sig.name)
+            if actual is None:
+                errors.append(
+                    f"adt {adt.name}: signature '{sig.name}' has no "
+                    f"implementing procedure")
+                continue
+            if actual != (sig.arity_in, sig.arity_out):
+                errors.append(
+                    f"adt {adt.name}: signature '{sig.name}' has arity "
+                    f"({sig.arity_in};{sig.arity_out}) but procedure has "
+                    f"({actual[0]};{actual[1]})")
+
     if errors:
         raise ValueError("LP Form validation errors:\n" +
                          "\n".join(f"  - {e}" for e in errors))
 
 
 # -- Tail call marking --
+
+def _flatten_outputs(outputs):
+    """Flatten a list of outputs that may contain LPPattern into plain names."""
+    result = []
+    for o in outputs:
+        if isinstance(o, LPPattern):
+            result.extend(o.vars)
+        else:
+            result.append(o)
+    return result
+
 
 def mark_tail_calls(program):
     """Mark calls that are in tail position.
@@ -243,7 +374,8 @@ def mark_tail_calls(program):
                 continue
             last = clause.goals[-1]
             if isinstance(last, Call):
-                if last.outputs == clause.head.outputs:
+                flat = _flatten_outputs(last.outputs)
+                if flat == clause.head.outputs:
                     last.is_tail = True
 
 
@@ -254,7 +386,18 @@ def _fmt_val(v):
         return v.name
     elif isinstance(v, LPConst):
         return str(v.value)
+    elif isinstance(v, LPFieldAccess):
+        return f"{_fmt_val(v.expr)}.{v.field}"
     return repr(v)
+
+def _fmt_out(o):
+    if isinstance(o, LPPattern):
+        if o.ctor == "_":
+            return "_"
+        if not o.vars:
+            return o.ctor
+        return f"{o.ctor}({', '.join(o.vars)})"
+    return str(o)
 
 def _fmt_goal(g):
     if isinstance(g, Guard):
@@ -267,7 +410,7 @@ def _fmt_goal(g):
         return f"{g.op}({ins}; {outs})"
     elif isinstance(g, Call):
         ins = ", ".join(_fmt_val(v) for v in g.inputs)
-        outs = ", ".join(g.outputs)
+        outs = ", ".join(_fmt_out(o) for o in g.outputs)
         return f"{g.name}({ins}; {outs})"
     return repr(g)
 
@@ -278,7 +421,25 @@ def pretty_print(program):
         lines.append(f"global {g.name} = {g.initial}.")
     for a in program.arrays:
         lines.append(f"array {a.name}.")
-    if program.globals or program.arrays:
+    for s in program.structs:
+        fields = ", ".join(f"{fn}: {ft}" for fn, ft in s.fields)
+        lines.append(f"struct {s.name} {{ {fields} }}.")
+    for s in program.sums:
+        ctors = " | ".join(
+            f"{c.name}({', '.join(c.params)})" if c.params else c.name
+            for c in s.constructors)
+        lines.append(f"type {s.name} = {ctors}.")
+    for a in (program.adts or []):
+        sig_lines = []
+        for sig in a.signatures:
+            ins = ", ".join(f"_i{i}" for i in range(sig.arity_in))
+            outs = ", ".join(f"_o{i}" for i in range(sig.arity_out))
+            sig_lines.append(f"    {sig.name}({ins}; {outs})")
+        lines.append(f"adt {a.name} {{")
+        lines.extend(sig_lines)
+        lines.append("}.")
+    if (program.globals or program.arrays or program.structs or
+            program.sums or program.adts):
         lines.append("")
     for proc in program.procedures:
         for clause in proc.clauses:
@@ -293,3 +454,24 @@ def pretty_print(program):
                 lines.append(head_str)
         lines.append("")
     return "\n".join(lines)
+
+
+# -- Variable collection helpers --
+
+def collect_vars_from_val(v, vs):
+    """Add variable names referenced by a value to set `vs`."""
+    if isinstance(v, LPVar):
+        vs.add(v.name)
+    elif isinstance(v, LPFieldAccess):
+        collect_vars_from_val(v.expr, vs)
+
+
+def flatten_outputs(outputs):
+    """Flatten outputs list: LPPattern -> individual var names."""
+    result = []
+    for o in outputs:
+        if isinstance(o, LPPattern):
+            result.extend(o.vars)
+        else:
+            result.append(o)
+    return result

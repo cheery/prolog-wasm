@@ -23,7 +23,8 @@ encoding stays sound).
 """
 
 from lp_form import (LPProgram, LPProc, LPClause, LPHead,
-                     PrimOp, Guard, Call, LPVar, LPConst)
+                     PrimOp, Guard, Call, LPVar, LPConst,
+                     LPStructDecl, LPConstructor, LPSumDecl)
 import z3 as _z3
 
 
@@ -150,6 +151,50 @@ class CHCExtractor:
             lines.append("(declare-fun lp_and (Int Int) Int)")
         if self._uses_or:
             lines.append("(declare-fun lp_or (Int Int) Int)")
+
+        # Struct / sum types as uninterpreted Int-valued accessors.
+        #
+        # LP Form procedure signatures carry only Int arguments, so a sum
+        # type cell flows through CHC as a fresh Int-sorted "handle" whose
+        # tag and payload fields are read via uninterpreted functions. The
+        # solver does not get constructor distinctness for free — that is
+        # recovered at the tag level (different constructors have
+        # different integer tags, and the emitter's tag-guard dispatch
+        # surfaces this to the solver as `(= Cell___tag(c) K)`).
+        #
+        # Each type also gets a constructor function `T` whose arity matches
+        # the field count; axioms `T_f(T x ...) = x` connect struct_new to
+        # struct_get.
+        for s in self.program.structs:
+            n = len(s.fields)
+            ints = " ".join(["Int"] * n)
+            lines.append(f"(declare-fun {s.name} ({ints}) Int)")
+            for fn, _ft in s.fields:
+                lines.append(
+                    f"(declare-fun {s.name}_{fn} (Int) Int)")
+            for i, (fn, _ft) in enumerate(s.fields):
+                args = " ".join(f"v{j}" for j in range(n))
+                qvars = " ".join(f"(v{j} Int)" for j in range(n))
+                lines.append(
+                    f"(assert (forall ({qvars}) "
+                    f"(= ({s.name}_{fn} ({s.name} {args})) v{i})))")
+        for s in self.program.sums:
+            max_params = max(len(c.params) for c in s.constructors)
+            n = 1 + max_params  # tag + payload
+            ints = " ".join(["Int"] * n)
+            lines.append(f"(declare-fun {s.name} ({ints}) Int)")
+            lines.append(
+                f"(declare-fun {s.name}___tag (Int) Int)")
+            for i in range(max_params):
+                lines.append(
+                    f"(declare-fun {s.name}__f{i} (Int) Int)")
+            field_names = ["__tag"] + [f"_f{i}" for i in range(max_params)]
+            for i, fn in enumerate(field_names):
+                args = " ".join(f"v{j}" for j in range(n))
+                qvars = " ".join(f"(v{j} Int)" for j in range(n))
+                lines.append(
+                    f"(assert (forall ({qvars}) "
+                    f"(= ({s.name}_{fn} ({s.name} {args})) v{i})))")
 
         for proc in self.program.procedures:
             types = self._pred_signature(proc)
@@ -405,6 +450,30 @@ class CHCExtractor:
             size = self._val(goal.inputs[1]) if len(goal.inputs) > 1 else "0"
             constraints.append(f"(= {new} ({aname}_new {size}))")
             cur_a[aname] = new
+        elif op == "struct_new":
+            type_name = goal.inputs[0].name
+            out = _smt_id(goal.outputs[0])
+            var_types[out] = "Int"
+            args = [self._val(v) for v in goal.inputs[1:]]
+            constraints.append(
+                f"(= {out} ({type_name} {' '.join(args)}))")
+        elif op == "struct_get":
+            if goal.meta and "type" in goal.meta:
+                type_name = goal.meta["type"]
+                field_name = goal.meta["field"]
+                out = _smt_id(goal.outputs[0])
+                var_types[out] = "Int"
+                inp = self._val(goal.inputs[0])
+                constraints.append(
+                    f"(= {out} ({type_name}_{field_name} {inp}))")
+            else:
+                type_name = goal.inputs[0].name
+                field_name = goal.inputs[2].name
+                out = _smt_id(goal.outputs[0])
+                var_types[out] = "Int"
+                inp = self._val(goal.inputs[1])
+                constraints.append(
+                    f"(= {out} ({type_name}_{field_name} {inp}))")
 
     def _collect_call(self, goal, var_types, cur_g, cur_a,
                       fresh_g, fresh_a, constraints):
@@ -619,6 +688,24 @@ class CHCExtractor:
                 size = val_for(goal.inputs[1]) if len(goal.inputs) > 1 else "0"
                 def_parts.append(f"(= {n} ({aname}_new {size}))")
                 cur_a[aname] = n
+            elif op == "struct_new":
+                # struct_new in preamble — treat as opaque
+                out = rename(goal.outputs[0])
+                args = [val_for(v) for v in goal.inputs[1:]]
+                type_name = goal.inputs[0].name
+                def_parts.append(
+                    f"(= {out} ({type_name} {' '.join(args)}))")
+            elif op == "struct_get":
+                if goal.meta and "type" in goal.meta:
+                    type_name = goal.meta["type"]
+                    field_name = goal.meta["field"]
+                    out = rename(goal.outputs[0])
+                    inp = val_for(goal.inputs[0])
+                    def_parts.append(
+                        f"(= {out} ({type_name}_{field_name} {inp}))")
+                else:
+                    out = rename(goal.outputs[0])
+                    # leave unconstrained
             else:
                 raise NotImplementedError(
                     f"PrimOp {op!r} not supported in preamble negation")
@@ -799,6 +886,33 @@ class CHCExtractor:
                             if len(goal.inputs) > 1 else "0")
                     constraints.append(f"(= {new} ({aname}_new {size}))")
                     cur_a[aname] = new
+                elif op == "struct_new":
+                    # struct_new(Type, val1, val2, ...; result)
+                    type_name = goal.inputs[0].name
+                    out = _smt_id(goal.outputs[0])
+                    var_types[out] = type_name
+                    args = [self._val(v) for v in goal.inputs[1:]]
+                    constraints.append(
+                        f"(= {out} ({type_name} {' '.join(args)}))")
+                elif op == "struct_get":
+                    # struct_get(val; result) with meta
+                    if goal.meta and "type" in goal.meta:
+                        type_name = goal.meta["type"]
+                        field_name = goal.meta["field"]
+                        out = _smt_id(goal.outputs[0])
+                        var_types[out] = "Int"
+                        inp = self._val(goal.inputs[0])
+                        constraints.append(
+                            f"(= {out} ({type_name}_{field_name} {inp}))")
+                    else:
+                        # Legacy 3-arg form
+                        type_name = goal.inputs[0].name
+                        field_name = goal.inputs[2].name
+                        out = _smt_id(goal.outputs[0])
+                        var_types[out] = "Int"
+                        inp = self._val(goal.inputs[1])
+                        constraints.append(
+                            f"(= {out} ({type_name}_{field_name} {inp}))")
                 else:
                     raise NotImplementedError(
                         f"PrimOp {op!r} not supported in CHC extraction")
@@ -970,13 +1084,44 @@ def extract_chc(program: LPProgram, slice_to=None) -> str:
     Spacer handles small sliced programs much better than the full
     runtime, so property tests that target a single predicate should
     slice aggressively.
+
+    If the program has structs/sums or contains LPPattern/LPFieldAccess
+    nodes, it is elaborated first so CHC only sees the core IR.
     """
+    from lp_elaborate import elaborate
+    if (program.structs or program.sums
+            or _needs_elaboration(program)):
+        program = elaborate(program)
+
     if slice_to is not None:
         keep = _transitive_callees(program, list(slice_to))
         program = LPProgram(
             procedures=[p for p in program.procedures if p.name in keep],
             globals=program.globals,
             arrays=program.arrays,
+            structs=program.structs,
+            sums=program.sums,
             entry=program.entry,
         )
     return CHCExtractor(program).emit()
+
+
+def _needs_elaboration(program: LPProgram) -> bool:
+    """Check whether any clause still carries surface-level type nodes."""
+    from lp_form import LPPattern, LPFieldAccess
+    for proc in program.procedures:
+        for clause in proc.clauses:
+            for goal in clause.goals:
+                if isinstance(goal, (PrimOp, Call)):
+                    for out in goal.outputs:
+                        if isinstance(out, LPPattern):
+                            return True
+                    for inp in goal.inputs:
+                        if isinstance(inp, LPFieldAccess):
+                            return True
+                if isinstance(goal, Guard):
+                    if isinstance(goal.left, LPFieldAccess):
+                        return True
+                    if isinstance(goal.right, LPFieldAccess):
+                        return True
+    return False
