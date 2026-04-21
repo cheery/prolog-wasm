@@ -112,6 +112,9 @@ class LPProc:
     clauses: list        # list[LPClause]
     invariant: object = None  # future: CHC-inferred invariant
     measure: object = None    # termination measure: list[str] of input names
+    invertible: bool = False  # if True, emitter skips trace writes for this
+                              # proc (Phase 7e). Must be a pure leaf proc —
+                              # no Calls, no gset/aset/anew/rnew.
 
 @dataclass
 class LPProgram:

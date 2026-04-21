@@ -82,6 +82,8 @@ class LPEmitter:
     def compile(self, program: LPProgram) -> bytes:
         self._program = program
 
+        self._check_invertibility(program)
+
         # --- Allocate WASM types ---
         self._types = []
         self._sig_to_typeidx = {}
@@ -245,6 +247,29 @@ class LPEmitter:
         else:
             return self._compile_multi_clause(proc)
 
+    def _check_invertibility(self, program: LPProgram) -> None:
+        """Reject procs marked invertible=True that aren't pure leaves.
+
+        MVP constraint: an invertible proc may not issue Calls or mutate
+        state (no gset, aset, anew, rnew). Trace elision for such procs
+        would otherwise leave the replay interpreter unable to reconstruct
+        their effect.
+        """
+        MUTATING_PRIMOPS = {"gset", "aset", "anew", "rnew"}
+        for proc in program.procedures:
+            if not proc.invertible:
+                continue
+            for clause in proc.clauses:
+                for goal in clause.goals:
+                    if isinstance(goal, Call):
+                        raise ValueError(
+                            f"proc '{proc.name}' is marked invertible but "
+                            f"contains a Call to '{goal.name}'")
+                    if isinstance(goal, PrimOp) and goal.op in MUTATING_PRIMOPS:
+                        raise ValueError(
+                            f"proc '{proc.name}' is marked invertible but "
+                            f"contains mutating PrimOp '{goal.op}'")
+
     def _compile_single_clause(self, proc, clause):
         params = list(clause.head.inputs)
         ir = WIR(params, results=[I32] * proc.arity_out)
@@ -259,7 +284,7 @@ class LPEmitter:
 
         var_map = {v: v for v in all_vars}
 
-        if self.trace:
+        if self.trace and not self._cur_proc.invertible:
             self._emit_trace_append(
                 ir, self._cur_proc_id, 0, clause.head.inputs, var_map)
 
@@ -327,7 +352,7 @@ class LPEmitter:
         if is_last:
             # Last clause: no guard check, just execute everything.
             # Trace fires unconditionally since this clause is the fallback.
-            if self.trace:
+            if self.trace and not self._cur_proc.invertible:
                 self._emit_trace_append(
                     ir, self._cur_proc_id, idx,
                     clause.head.inputs, var_map)
@@ -345,7 +370,7 @@ class LPEmitter:
 
         if last_guard_idx == -1:
             # No guards but not last clause — emit everything
-            if self.trace:
+            if self.trace and not self._cur_proc.invertible:
                 self._emit_trace_append(
                     ir, self._cur_proc_id, idx,
                     clause.head.inputs, var_map)
@@ -381,7 +406,7 @@ class LPEmitter:
         # if guards hold: trace + execute suffix + push outputs
         # else: try next clause
         with ir.if_else(result_bt) as ie:
-            if self.trace:
+            if self.trace and not self._cur_proc.invertible:
                 self._emit_trace_append(
                     ir, self._cur_proc_id, idx,
                     clause.head.inputs, var_map)

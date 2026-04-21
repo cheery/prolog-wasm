@@ -19,6 +19,7 @@ from wasmtime import _ffi as _wt_ffi
 from lp_form import *
 from lp_parser import parse_lp
 from lp_pipeline import lp_compile
+from trace_tool import Trace
 
 
 PASS = "\033[32mPASS\033[0m"
@@ -65,17 +66,11 @@ class TracedModule:
 
 
 def decode_trace(cells):
-    """Parse the flat cells into a list of (proc_id, clause_idx, [inputs])."""
-    records = []
-    i = 0
-    while i < len(cells):
-        size = cells[i]
-        proc_id = cells[i + 1]
-        clause_idx = cells[i + 2]
-        inputs = cells[i + 3 : i + 1 + size]
-        records.append((proc_id, clause_idx, inputs))
-        i += 1 + size
-    return records
+    """Parse the flat cells into a list of (proc_id, clause_idx, [inputs]).
+
+    Thin shim over `trace_tool.Trace` so existing assertions keep working.
+    """
+    return [(r.proc_id, r.clause_idx, r.inputs) for r in Trace(cells)]
 
 
 # ---------------------------------------------------------------------------
