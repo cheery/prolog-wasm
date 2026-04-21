@@ -124,6 +124,55 @@ class LPProgram:
     arrays: list = field(default_factory=list)    # list[ArrayDecl]
     entry: str = None    # name of entry-point procedure
 
+    def link(self, other: "LPProgram") -> "LPProgram":
+        """Merge another LPProgram into this one.
+
+        Concatenates procedures, globals, and arrays. Duplicate global
+        declarations (same name AND same initial value) and duplicate
+        array declarations (same name AND same kind) are deduplicated
+        silently; mismatches and procedure name clashes raise.
+
+        The result uses self.entry. The other program's entry is ignored.
+        """
+        my_procs = {p.name for p in self.procedures}
+        for p in other.procedures:
+            if p.name in my_procs:
+                raise ValueError(
+                    f"link: duplicate procedure '{p.name}'")
+
+        my_globals = {g.name: g for g in self.globals}
+        merged_globals = list(self.globals)
+        for g in other.globals:
+            if g.name in my_globals:
+                existing = my_globals[g.name]
+                if existing.initial != g.initial:
+                    raise ValueError(
+                        f"link: global '{g.name}' initial value mismatch "
+                        f"({existing.initial} vs {g.initial})")
+            else:
+                merged_globals.append(g)
+                my_globals[g.name] = g
+
+        my_arrays = {a.name: a for a in self.arrays}
+        merged_arrays = list(self.arrays)
+        for a in other.arrays:
+            if a.name in my_arrays:
+                existing = my_arrays[a.name]
+                if existing.kind != a.kind:
+                    raise ValueError(
+                        f"link: array '{a.name}' kind mismatch "
+                        f"({existing.kind} vs {a.kind})")
+            else:
+                merged_arrays.append(a)
+                my_arrays[a.name] = a
+
+        return LPProgram(
+            procedures=list(self.procedures) + list(other.procedures),
+            globals=merged_globals,
+            arrays=merged_arrays,
+            entry=self.entry,
+        )
+
 
 # -- Validation --
 

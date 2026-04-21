@@ -300,6 +300,34 @@ restore_xregs(b, i, n;):
     restore_xregs(b, i', n;).
 
 // ===================================================================
+// Prolog front-end helpers
+// ===================================================================
+// These are the primitive building blocks used by prolog_to_lp.py
+// when lowering a Prolog program. Each Prolog clause becomes an LP
+// procedure that takes one heap address per argument and composes
+// the primitives below to match head and execute body.
+
+// put_variable(; addr) — allocate a fresh unbound variable cell
+// (REF pointing to itself), return its heap address.
+put_variable(; addr):
+    gget(H; addr),
+    heap_push(0, addr; _).
+
+// put_constant(val; addr) — allocate a constant cell (CON/val),
+// return its heap address.
+put_constant(val; addr):
+    heap_push(1, val; addr).
+
+// match_constant(arg, val;) — unify heap cell `arg` with CON(val).
+// Sets FAIL=1 if unification fails. Skipped if FAIL is already set.
+match_constant(arg, val;):
+    gget(FAIL; f), f != 0.
+match_constant(arg, val;):
+    gget(FAIL; f), f == 0,
+    heap_push(1, val; c),
+    unify(arg, c;).
+
+// ===================================================================
 // test(; result) — unify f(X) with f(42), return X = 42
 // ===================================================================
 test(; result):
