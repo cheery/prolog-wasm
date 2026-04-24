@@ -236,7 +236,7 @@ python3 test_wam_runtime.py
 
 The same source can be passed to `chc.py` and fed to Z3 for property
 checking (the declarations parse; properties about deref termination
-and trail consistency are future work — see `PLAN.md`).
+and trail consistency are future work).
 
 ## Prolog, as a secondary frontend
 

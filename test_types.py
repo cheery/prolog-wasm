@@ -1,6 +1,6 @@
 """Tests for the LP Form type system (Phase 9).
 
-Covers the three layers described in DT-PLAN.md:
+Covers three layers of the type system:
 
   Layer 1 — structs.       Tested end-to-end (parse, compile, run).
   Layer 2 — sum types.     Pattern dispatch, exhaustiveness, CHC emission.
@@ -429,6 +429,72 @@ def test_wam_runtime_still_parses():
 
 
 # ---------------------------------------------------------------------------
+# Cross-procedure ref-typed outputs
+# ---------------------------------------------------------------------------
+
+def test_cross_proc_struct_return():
+    """A procedure returning a struct, caller accesses a field."""
+    src = """
+    struct Cell { tag: i32, val: i32 }.
+
+    make_cell(t, v; c):
+        struct_new(Cell, t, v; c).
+
+    get_tag_from_callee(t, v; out):
+        make_cell(t, v; c),
+        copy(c.tag; out).
+    """
+    prog = parse_lp(src)
+    wasm = lp_compile(prog)
+    assert _run_wasm(wasm, "run", 7, 42) == 7
+    assert _run_wasm(wasm, "run", 99, 1) == 99
+    print(f"  test_cross_proc_struct_return: {PASS}")
+
+
+def test_cross_proc_struct_both_fields():
+    """A procedure returning a struct, caller accesses both fields."""
+    src = """
+    struct Cell { tag: i32, val: i32 }.
+
+    make_cell(t, v; c):
+        struct_new(Cell, t, v; c).
+
+    sum_fields(t, v; out):
+        make_cell(t, v; c),
+        copy(c.tag; tag),
+        copy(c.val; val),
+        add(tag, val; out).
+    """
+    prog = parse_lp(src, entry="sum_fields")
+    wasm = lp_compile(prog)
+    assert _run_wasm(wasm, "run", 7, 42) == 49
+    assert _run_wasm(wasm, "run", 100, 200) == 300
+    print(f"  test_cross_proc_struct_both_fields: {PASS}")
+
+
+def test_infer_output_types():
+    """infer_output_types correctly annotates procs."""
+    src = """
+    struct Point { x: i32, y: i32 }.
+
+    make_point(a, b; p):
+        struct_new(Point, a, b; p).
+
+    id(x; y): copy(x; y).
+    """
+    prog = parse_lp(src)
+    from lp_form import infer_output_types
+    infer_output_types(prog)
+    # make_point should have output_types = ["Point"]
+    make_point = [p for p in prog.procedures if p.name == "make_point"][0]
+    assert make_point.output_types == ["Point"]
+    # id should have output_types = [None]
+    id_proc = [p for p in prog.procedures if p.name == "id"][0]
+    assert id_proc.output_types == [None]
+    print(f"  test_infer_output_types: {PASS}")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -452,6 +518,9 @@ TESTS = [
     test_adt_pretty_print,
     test_adt_compiles_to_wasm,
     test_wam_runtime_still_parses,
+    test_cross_proc_struct_return,
+    test_cross_proc_struct_both_fields,
+    test_infer_output_types,
 ]
 
 

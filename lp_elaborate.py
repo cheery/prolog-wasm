@@ -26,6 +26,7 @@ class TypeEnv:
         self.sums = {}       # name -> LPSumDecl
         self.ctors = {}      # ctor_name -> (LPSumDecl, LPConstructor, tag_index)
         self._layouts = {}   # type_name -> list of (field_name, field_type)
+        self._proc_output_types = {}  # proc_name -> list[type_name|None]
 
         for s in program.structs:
             self.structs[s.name] = s
@@ -36,6 +37,10 @@ class TypeEnv:
             self._layouts[s.name] = self._compute_sum_layout(s)
             for i, ctor in enumerate(s.constructors):
                 self.ctors[ctor.name] = (s, ctor, i)
+
+        for p in program.procedures:
+            if p.output_types is not None:
+                self._proc_output_types[p.name] = p.output_types
 
     @staticmethod
     def _compute_sum_layout(sum_decl):
@@ -74,6 +79,13 @@ class TypeEnv:
 
     def ctor_info(self, name):
         return self.ctors[name]
+
+    def call_output_type(self, proc_name, output_idx):
+        """Return the type name for a call output, or None."""
+        types = self._proc_output_types.get(proc_name)
+        if types is None or output_idx >= len(types):
+            return None
+        return types[output_idx]
 
 
 def elaborate(program: LPProgram) -> LPProgram:
@@ -203,6 +215,7 @@ def _elaborate_proc(proc, env):
         invariant=proc.invariant,
         measure=proc.measure,
         invertible=proc.invertible,
+        output_types=proc.output_types,
     )
 
 
@@ -266,7 +279,7 @@ def _elaborate_clause(clause, env):
             new_outputs = []
             destructuring = []  # goals to emit AFTER the call
 
-            for out in goal.outputs:
+            for oi, out in enumerate(goal.outputs):
                 if isinstance(out, LPPattern):
                     cell_var = fresh()
                     new_outputs.append(cell_var)
@@ -306,6 +319,10 @@ def _elaborate_clause(clause, env):
                             f"unknown constructor '{out.ctor}'")
                 else:
                     new_outputs.append(out)
+                    # Track type from callee's output_types
+                    callee_type = env.call_output_type(goal.name, oi)
+                    if callee_type is not None:
+                        var_types[out] = callee_type
 
             # Emit the call first, then destructuring goals
             goals.append(Call(

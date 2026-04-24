@@ -1,4 +1,4 @@
-"""Tests for trace instrumentation (Phase 5 of PLAN.md).
+"""Tests for trace instrumentation.
 
 When LPEmitter(trace=True), each clause firing appends a record of the
 form [size, proc_id, clause_idx, *inputs] to a GC array trace buffer.

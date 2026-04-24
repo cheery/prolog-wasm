@@ -10,7 +10,7 @@ Usage:
     wasm_bytes = lp_compile(program)
 """
 
-from lp_form import validate, mark_tail_calls, LPProgram
+from lp_form import validate, mark_tail_calls, infer_output_types, LPProgram
 from lp_elaborate import elaborate
 from lp_emit import LPEmitter
 
@@ -20,14 +20,17 @@ def lp_compile(program: LPProgram, trace: bool = False,
     """Compile an LP Form program to WASM module bytes.
 
     1. Validates the program structure
-    2. Elaborates type features (patterns, field access)
-    3. Marks tail calls for optimization
-    4. Emits WASM via LPEmitter
+    2. Infers output types for ref-typed returns (before elaboration,
+       so elaboration can resolve field access on call outputs)
+    3. Elaborates type features (patterns, field access)
+    4. Marks tail calls for optimization
+    5. Emits WASM via LPEmitter
 
     When trace=True, the emitter also writes a per-clause execution trace
     to an i32 GC array and exports accessor functions (see LPEmitter docs).
     """
     validate(program)
+    infer_output_types(program)
 
     # Run elaboration if there are type declarations or patterns/field access
     needs_elaboration = (

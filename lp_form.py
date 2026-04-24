@@ -129,7 +129,7 @@ class LPADT:
 
     Rationale: ADTs exist to (a) document the interface boundary for
     modular verification, and (b) eventually carry compiler hints for
-    the dual WASM/CHC projection described in DT-PLAN.md. For now the
+    the dual WASM/CHC projection. For now the
     block is descriptive — the emitter and CHC extractor use the
     procedures directly.
     """
@@ -179,6 +179,8 @@ class LPProc:
     invertible: bool = False  # if True, emitter skips trace writes for this
                               # proc (Phase 7e). Must be a pure leaf proc —
                               # no Calls, no gset/aset/anew/rnew.
+    output_types: list = None  # list of output type names (None for i32).
+                               # Computed by infer_output_types().
 
 @dataclass
 class LPProgram:
@@ -475,3 +477,79 @@ def flatten_outputs(outputs):
         else:
             result.append(o)
     return result
+
+
+def infer_output_types(program):
+    """Infer the WASM result types for each procedure's outputs.
+
+    Populates proc.output_types as a list of type names (str) or None (i32).
+    A proc's output is a ref type if any clause assigns a struct_new result
+    to the corresponding head output variable.
+
+    Returns the program (mutated in place).
+    """
+    struct_names = {s.name for s in program.structs}
+    sum_names = {s.name for s in program.sums}
+    all_type_names = struct_names | sum_names
+    proc_by_name = {p.name: p for p in program.procedures}
+
+    # Phase 1: direct struct_new assignments
+    for proc in program.procedures:
+        types = [None] * proc.arity_out
+        for clause in proc.clauses:
+            # Map: var_name -> output_position
+            out_vars = {}
+            for i, o in enumerate(clause.head.outputs):
+                out_vars[o] = i
+
+            for goal in clause.goals:
+                if isinstance(goal, PrimOp) and goal.op == "struct_new":
+                    type_name = goal.inputs[0].name if isinstance(goal.inputs[0], LPVar) else None
+                    if type_name in all_type_names:
+                        for out in goal.outputs:
+                            pos = out_vars.get(out)
+                            if pos is not None:
+                                types[pos] = type_name
+                if isinstance(goal, PrimOp) and goal.op == "copy":
+                    # copy doesn't change the type — but if the source is
+                    # from a call we haven't typed yet, we'll catch it in
+                    # phase 2.
+                    pass
+                if isinstance(goal, Call):
+                    callee = proc_by_name.get(goal.name)
+                    if callee is not None and callee.output_types is not None:
+                        for i, out in enumerate(goal.outputs):
+                            if isinstance(out, str) and i < len(callee.output_types):
+                                ct = callee.output_types[i]
+                                if ct is not None:
+                                    pos = out_vars.get(out)
+                                    if pos is not None and types[pos] is None:
+                                        types[pos] = ct
+
+        proc.output_types = types
+
+    # Phase 2: propagate call results (fixed point)
+    changed = True
+    while changed:
+        changed = False
+        for proc in program.procedures:
+            for clause in proc.clauses:
+                out_vars = {}
+                for i, o in enumerate(clause.head.outputs):
+                    out_vars[o] = i
+
+                for goal in clause.goals:
+                    if isinstance(goal, Call):
+                        callee = proc_by_name.get(goal.name)
+                        if callee is None or callee.output_types is None:
+                            continue
+                        for i, out in enumerate(goal.outputs):
+                            if isinstance(out, str) and i < len(callee.output_types):
+                                ct = callee.output_types[i]
+                                if ct is not None:
+                                    pos = out_vars.get(out)
+                                    if pos is not None and proc.output_types[pos] is None:
+                                        proc.output_types[pos] = ct
+                                        changed = True
+
+    return program

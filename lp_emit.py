@@ -83,6 +83,7 @@ class LPEmitter:
 
     def compile(self, program: LPProgram) -> bytes:
         self._program = program
+        self._program_procs_by_name = {p.name: p for p in program.procedures}
 
         self._check_invertibility(program)
 
@@ -181,11 +182,11 @@ class LPEmitter:
         func_codes = []
 
         for proc in program.procedures:
-            sig = (proc.arity_in, proc.arity_out)
+            result_types = self._proc_result_types(proc)
             ti = self._ensure_functype(
-                [I32] * sig[0], [I32] * sig[1])
+                [I32] * proc.arity_in, result_types)
             func_type_indices.append(ti)
-            code = self._compile_proc(proc)
+            code = self._compile_proc(proc, result_types)
             func_codes.append(code)
 
         # --- Trace helper functions ---
@@ -223,18 +224,44 @@ class LPEmitter:
                     break
 
             if entry_proc:
-                wrapper_ti = self._ensure_functype(
-                    [I32] * entry_proc.arity_in,
-                    [I32] * entry_proc.arity_out)
-                params = [f"p{i}" for i in range(entry_proc.arity_in)]
-                ir = WIR(params, results=[I32] * entry_proc.arity_out)
-                # Auto-initialize the trace buffer on each top-level call so
-                # repeated invocations start from a clean trace.
-                if self.trace:
-                    ir.fn_call(trace_init_idx)
-                for p in params:
-                    ir.local(p)
-                ir.return_call(self._proc_index[program.entry])
+                result_types = self._proc_result_types(entry_proc)
+                has_ref_output = any(
+                    t is not None and t in self._struct_type_indices
+                    for t in (entry_proc.output_types or [None]))
+
+                if not has_ref_output:
+                    # Fast path: all i32 results, use return_call
+                    wrapper_ti = self._ensure_functype(
+                        [I32] * entry_proc.arity_in, result_types)
+                    params = [f"p{i}" for i in range(entry_proc.arity_in)]
+                    ir = WIR(params, results=result_types)
+                    if self.trace:
+                        ir.fn_call(trace_init_idx)
+                    for p in params:
+                        ir.local(p)
+                    ir.return_call(self._proc_index[program.entry])
+                else:
+                    # Ref-typed results: call the proc, extract first i32
+                    # field from each ref result for the CLI-friendly wrapper.
+                    wrapper_ti = self._ensure_functype(
+                        [I32] * entry_proc.arity_in,
+                        [I32] * entry_proc.arity_out)
+                    params = [f"p{i}" for i in range(entry_proc.arity_in)]
+                    ir = WIR(params, results=[I32] * entry_proc.arity_out)
+                    if self.trace:
+                        ir.fn_call(trace_init_idx)
+                    for p in params:
+                        ir.local(p)
+                    ir.fn_call(self._proc_index[program.entry])
+                    # Extract first i32 field from each ref result
+                    for oi in range(entry_proc.arity_out):
+                        type_name = (entry_proc.output_types[oi]
+                                     if entry_proc.output_types
+                                     else None)
+                        if type_name is not None and type_name in self._struct_type_indices:
+                            ti = self._struct_type_indices[type_name]
+                            ir._emit(_struct_get(ti, 0))
+                        # else: already i32 on stack
 
                 wrapper_idx = len(func_type_indices)
                 func_type_indices.append(wrapper_ti)
@@ -262,17 +289,43 @@ class LPEmitter:
             self._sig_to_typeidx[key] = ti
         return self._sig_to_typeidx[key]
 
+    def _proc_result_types(self, proc):
+        """Compute WASM result type list for a proc based on output_types."""
+        if proc.output_types is None:
+            return [I32] * proc.arity_out
+        result = []
+        for type_name in proc.output_types:
+            if type_name is not None and type_name in self._struct_type_indices:
+                ti = self._struct_type_indices[type_name]
+                result.append(reftype(True, ti))
+            else:
+                result.append(I32)
+        return result
+
+    def _output_is_ref(self, proc, output_idx):
+        """Check if a specific output of a proc is ref-typed."""
+        if proc.output_types is None:
+            return False
+        type_name = proc.output_types[output_idx] if output_idx < len(proc.output_types) else None
+        return type_name is not None and type_name in self._struct_type_indices
+
+    def _output_ref_type(self, proc, output_idx):
+        """Get the struct type index for a ref-typed output."""
+        type_name = proc.output_types[output_idx]
+        return self._struct_type_indices[type_name]
+
     # -----------------------------------------------------------------
     # Procedure compilation
     # -----------------------------------------------------------------
 
-    def _compile_proc(self, proc: LPProc) -> bytes:
+    def _compile_proc(self, proc: LPProc, result_types: list) -> bytes:
         self._cur_proc = proc
         self._cur_proc_id = self._proc_index[proc.name]
+        self._cur_result_types = result_types
         if len(proc.clauses) == 1:
-            return self._compile_single_clause(proc, proc.clauses[0])
+            return self._compile_single_clause(proc, proc.clauses[0], result_types)
         else:
-            return self._compile_multi_clause(proc)
+            return self._compile_multi_clause(proc, result_types)
 
     def _check_invertibility(self, program: LPProgram) -> None:
         """Reject procs marked invertible=True that aren't pure leaves.
@@ -297,9 +350,9 @@ class LPEmitter:
                             f"proc '{proc.name}' is marked invertible but "
                             f"contains mutating PrimOp '{goal.op}'")
 
-    def _compile_single_clause(self, proc, clause):
+    def _compile_single_clause(self, proc, clause, result_types):
         params = list(clause.head.inputs)
-        ir = WIR(params, results=[I32] * proc.arity_out)
+        ir = WIR(params, results=result_types)
 
         if self.trace:
             ir.new_local(_TRACE_TMP_LOCAL)
@@ -329,9 +382,9 @@ class LPEmitter:
 
         return ir.encode()
 
-    def _compile_multi_clause(self, proc):
+    def _compile_multi_clause(self, proc, result_types):
         params = list(proc.clauses[0].head.inputs)
-        ir = WIR(params, results=[I32] * proc.arity_out)
+        ir = WIR(params, results=result_types)
 
         if self.trace:
             ir.new_local(_TRACE_TMP_LOCAL)
@@ -360,7 +413,7 @@ class LPEmitter:
         # Block type for if-else that produces results
         result_bt = None
         if proc.arity_out > 0:
-            result_bt = self._ensure_functype([], [I32] * proc.arity_out)
+            result_bt = self._ensure_functype([], result_types)
 
         # Guard temp locals (shared across clause dispatch)
         guard_local_counter = [0]
@@ -626,11 +679,8 @@ class LPEmitter:
         """Return {var_name: struct_type_name} for variables that hold
         struct refs within this clause.
 
-        Only struct_new outputs are classified: those produce WASM GC
-        struct refs that must live in ref-typed locals. Variables that
-        ultimately flow from other sources (e.g. procedure outputs that
-        return struct refs) are not handled here — cross-procedure
-        struct-return requires signature typing, a future extension.
+        Covers struct_new outputs and call outputs where the callee has
+        ref-typed results.
         """
         struct_vars = {}
         for goal in clause.goals:
@@ -639,6 +689,14 @@ class LPEmitter:
                 if type_name in self._struct_type_indices:
                     for out in goal.outputs:
                         struct_vars[out] = type_name
+            elif isinstance(goal, Call):
+                callee = self._program_procs_by_name.get(goal.name)
+                if callee is not None and callee.output_types is not None:
+                    for i, out in enumerate(goal.outputs):
+                        if isinstance(out, str) and i < len(callee.output_types):
+                            type_name = callee.output_types[i]
+                            if type_name is not None and type_name in self._struct_type_indices:
+                                struct_vars[out] = type_name
         return struct_vars
 
     def _collect_clause_vars(self, clause):

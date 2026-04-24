@@ -1,4 +1,4 @@
-"""Host-side trace tooling for LP Form programs (Phase 7 of NEW-PLAN.md).
+"""Host-side trace tooling for LP Form programs.
 
 Three layers:
 
