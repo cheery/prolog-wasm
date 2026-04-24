@@ -10,6 +10,8 @@ but the interesting work has moved to LP Form: a language where the
 **same source** compiles to efficient WASM *and* extracts to CHC for
 formal verification, without two separate semantic models.
 
+For the full language specification, see [LP-FORM.md](LP-FORM.md).
+
 ## What is LP Form?
 
 LP Form is a restricted, single-moded logic-programming language based
