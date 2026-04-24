@@ -42,17 +42,21 @@ rule.
 
 | File | Description |
 |---|---|
-| `lp_form.py` | IR dataclasses, validator, pretty-printer |
+| `lp_form.py` | IR dataclasses, validator, pretty-printer, output type inference |
 | `lp_parser.py` | Lark parser for LP Form source syntax |
-| `lp_emit.py` | LP Form → WASM emitter |
-| `lp_pipeline.py` | `validate → mark_tail_calls → emit` |
+| `lp_elaborate.py` | Type elaboration pass (patterns → guards, field access → struct_get) |
+| `lp_emit.py` | LP Form → WASM emitter (with ref-typed returns) |
+| `lp_pipeline.py` | `validate → infer_output_types → elaborate → mark_tail_calls → emit` |
 | `chc.py` | LP Form → SMT-LIB2 CHC extractor |
 | `wam_runtime.lp` | WAM runtime written in LP Form |
 | `wasm/encoder.py` | Hand-rolled WASM binary encoder |
+| `plwasm.py` | Prolog → LP Form → WASM unified pipeline |
+| `prolog_to_lp.py` | Prolog → LP Form lowering |
 | `test_lp.py` | Compile LP programs and run in wasmtime |
 | `test_chc.py` | Extract CHC and check properties with Z3 |
+| `test_types.py` | Type system: structs, sums, ADTs, cross-proc ref returns |
 | `test_wam_runtime.py` | Compile `wam_runtime.lp` end-to-end |
-| `prolog_*.py`, `wam_*.py`, `wir.py`, `languages.py`, `nanopass.py` | Prolog frontend (see below) |
+| `test_e2e.py` | Prolog → LP Form → WASM end-to-end |
 
 ## Requirements
 
@@ -240,29 +244,29 @@ and trail consistency are future work).
 
 ## Prolog, as a secondary frontend
 
-The repository contains a working(-ish) Prolog compiler that predates
-LP Form:
+The Prolog frontend compiles through the LP Form pipeline:
 
 - `prolog_parser.py` — Lark grammar for a Prolog subset
-- `languages.py`, `nanopass.py`, `normalize_pass.py` — nanopass tower
-  (L0 surface AST → L1 normalized → L2 WAM instructions → L3 resolved
-  symbols)
-- `prolog_to_wam.py`, `wam_emit.py`, `wam_wasm.py` — compilation to
-  WAM instructions and then to WASM
+- `normalize_pass.py` — normalizes surface AST (expands lists, etc.)
+- `prolog_to_lp.py` — lowers normalized Prolog to LP Form IR
+- `plwasm.py` — `compile(source)` ties it all together: parse →
+  normalize → LP Form → link with `wam_runtime.lp` → WASM
 
-It still compiles and runs; `test_e2e.py` exercises the pipeline. The
-long-term plan is to retarget the Prolog frontend onto LP Form and
-use the same runtime written in `wam_runtime.lp`, but that integration
-is still figuring itself out.
+The old direct WAM path (`prolog_to_wam.py`, `wam_emit.py`) still
+exists but is no longer used by the tests.
 
 ## Running the tests
 
 ```bash
 python3 test_lp.py            # LP Form → WASM end-to-end (9 tests)
-python3 test_chc.py           # CHC extraction + Z3 verification (12 tests)
+python3 test_chc.py           # CHC extraction + Z3 verification (34 tests)
+python3 test_types.py         # Type system: structs, sums, ADTs (22 tests)
 python3 test_wam_runtime.py   # WAM runtime compiled from LP Form
+python3 test_e2e.py           # Prolog → LP Form → WASM end-to-end (7 tests)
+python3 test_phase6.py        # Prolog via plwasm.compile (6 tests)
+python3 test_trace.py         # Trace instrumentation (6 tests)
+python3 test_debugger.py      # Trace-driven debugger (7 tests)
 python3 test_nanopass.py      # Nanopass framework unit tests
-python3 test_e2e.py           # Prolog → WASM end-to-end
 ```
 
 ## References
